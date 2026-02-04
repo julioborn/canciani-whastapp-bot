@@ -696,10 +696,13 @@ async function wabaFetch(payload) {
 // ======================
 async function uploadMedia(buffer) {
   const form = new FormData();
+
   form.append("file", buffer, {
     filename: "qr.png",
     contentType: "image/png",
+    knownLength: buffer.length,
   });
+
   form.append("type", "image/png");
 
   const res = await fetch("https://waba-v2.360dialog.io/media", {
@@ -711,7 +714,15 @@ async function uploadMedia(buffer) {
     body: form,
   });
 
-  const json = await res.json();
+  const text = await res.text();
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    console.error("❌ MEDIA RESPONSE NO JSON:", text);
+    throw new Error("MEDIA RESPONSE INVALID");
+  }
 
   if (!res.ok) {
     console.error("❌ MEDIA UPLOAD ERROR:", json);
