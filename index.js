@@ -12,6 +12,7 @@ const Horario = require("./models/Horario");
 const PedidoDesposte = require("./models/PedidoDesposte");
 const PedidoRetiro = require("./models/PedidoRetiro");
 const Cliente = require("./models/Cliente");
+const generarQRPedido = require("./utils/generarQRPedido");
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
