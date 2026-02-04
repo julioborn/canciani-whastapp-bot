@@ -25,18 +25,21 @@ module.exports = async function generarQRPedido({ pedidoId, fecha, hora }) {
     ctx.fillRect(0, 0, width, height);
 
     // ======================
-    // LOGO
+    // LOGO (proporción correcta)
     // ======================
     const logoPath = path.join(__dirname, "../assets/canciani.jpg");
     const logo = await loadImage(logoPath);
 
-    const logoSize = 140;
+    const logoWidth = 140;
+    const ratio = logo.height / logo.width;
+    const logoHeight = logoWidth * ratio;
+
     ctx.drawImage(
         logo,
-        width / 2 - logoSize / 2,
+        width / 2 - logoWidth / 2,
         30,
-        logoSize,
-        logoSize
+        logoWidth,
+        logoHeight
     );
 
     // ======================
@@ -67,7 +70,7 @@ module.exports = async function generarQRPedido({ pedidoId, fecha, hora }) {
     // TEXTO FECHA
     // ======================
     ctx.fillStyle = "#000";
-    ctx.font = "bold 28px Sans";
+    ctx.font = "bold 28px Arial";
     ctx.textAlign = "center";
 
     ctx.fillText(
@@ -79,7 +82,7 @@ module.exports = async function generarQRPedido({ pedidoId, fecha, hora }) {
     // ======================
     // TEXTO HORA
     // ======================
-    ctx.font = "24px Sans";
+    ctx.font = "24px Arial";
     ctx.fillText(
         `${hora} hs`,
         width / 2,
