@@ -13,6 +13,7 @@ const PedidoDesposte = require("./models/PedidoDesposte");
 const PedidoRetiro = require("./models/PedidoRetiro");
 const Cliente = require("./models/Cliente");
 const generarQRPedido = require("./utils/generarQRPedido");
+const FormData = require("form-data");
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -646,12 +647,21 @@ async function finalizarPedido(to) {
   // 📸 PASO 4.3 → GENERAR + ENVIAR QR
   // ======================
 
+  const qrBuffer = await generarQRPedido({
+    pedidoId: pedido._id.toString(),
+    fecha: pedido.fecha,
+    hora: pedido.hora || "12:00",
+    telefono: pedido.telefono,
+  });
+
+  const mediaId = await uploadMedia(qrBuffer);
+
   await wabaFetch({
     messaging_product: "whatsapp",
     to,
     type: "image",
     image: {
-      link: `https://canciani-whatsapp-bot-production.up.railway.app/qr/${pedido._id}`,
+      id: mediaId,
     },
   });
 
@@ -679,6 +689,36 @@ async function wabaFetch(payload) {
   }
 
   return text;
+}
+
+// ======================
+// 📤 SUBIR IMAGEN A WHATSAPP (MEDIA)
+// ======================
+async function uploadMedia(buffer) {
+  const form = new FormData();
+  form.append("file", buffer, {
+    filename: "qr.png",
+    contentType: "image/png",
+  });
+  form.append("type", "image/png");
+
+  const res = await fetch("https://waba-v2.360dialog.io/media", {
+    method: "POST",
+    headers: {
+      "D360-API-KEY": process.env.WHATSAPP_API_KEY,
+      ...form.getHeaders(),
+    },
+    body: form,
+  });
+
+  const json = await res.json();
+
+  if (!res.ok) {
+    console.error("❌ MEDIA UPLOAD ERROR:", json);
+    throw new Error("MEDIA UPLOAD FAILED");
+  }
+
+  return json.media[0].id;
 }
 
 // ======================
