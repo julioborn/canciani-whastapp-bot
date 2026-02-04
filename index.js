@@ -12,6 +12,7 @@ const Horario = require("./models/Horario");
 const PedidoDesposte = require("./models/PedidoDesposte");
 const PedidoRetiro = require("./models/PedidoRetiro");
 const Cliente = require("./models/Cliente");
+const generarQRPedido = require("./utils/generarQRPedido");
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -586,10 +587,12 @@ async function finalizarPedido(to) {
   const precioUnitario = stock.precio;
   const precioTotal = precioUnitario * cantidad;
 
+  let pedido; // 👈 CLAVE: una sola variable
+
   if (tipoRetiro === "desposte") {
     // 🥩 TURNO DE DESPOSTE → bloquea horario
     try {
-      await PedidoDesposte.create({
+      pedido = await PedidoDesposte.create({
         telefono: to,
         nombreCliente: sessions[to].cliente.nombre,
         cantidad,
@@ -609,20 +612,27 @@ async function finalizarPedido(to) {
     }
   } else {
     // 📦 RETIRO → NO bloquea horarios
-    await PedidoRetiro.create({
+    pedido = await PedidoRetiro.create({
       telefono: to,
       nombreCliente: sessions[to].cliente.nombre,
       cantidad,
       fecha,
+      hora, // 👈 lo guardamos igual para unificar
       precioUnitario,
       precioTotal,
       retira: { nombre: sessions[to].retira },
     });
   }
 
+  // ======================
+  // DESCONTAR STOCK
+  // ======================
   stock.disponible -= cantidad;
   await stock.save();
 
+  // ======================
+  // MENSAJE CONFIRMACIÓN
+  // ======================
   await sendText(
     to,
     `✅ *Pedido reservado con éxito*\n\n` +
@@ -632,7 +642,23 @@ async function finalizarPedido(to) {
     `🕒 Hora: *${hora}*`
   );
 
-  //await sendMainMenu(to);
+  // ======================
+  // 📸 PASO 4.3 → GENERAR + ENVIAR QR
+  // ======================
+
+  await wabaFetch({
+    messaging_product: "whatsapp",
+    to,
+    type: "image",
+    image: {
+      link: `https://canciani-whatsapp-bot-production.up.railway.app/qr/${pedido._id}`,
+    },
+  });
+
+  await sendText(
+    to,
+    "📦 Este es tu *QR de retiro*.\n\n📍 Presentalo cuando vengas a retirar tu pedido."
+  );
 }
 
 async function wabaFetch(payload) {
@@ -761,6 +787,36 @@ app.post("/notify-entrega", async (req, res) => {
   } catch (e) {
     console.error("❌ Error enviando WhatsApp:", e);
     res.status(500).json({ error: "Error enviando WhatsApp" });
+  }
+});
+
+// ======================
+// 📸 GENERAR QR DEL PEDIDO
+// ======================
+app.get("/qr/:pedidoId", async (req, res) => {
+  try {
+    const { pedidoId } = req.params;
+
+    const pedido =
+      (await PedidoDesposte.findById(pedidoId)) ||
+      (await PedidoRetiro.findById(pedidoId));
+
+    if (!pedido) {
+      return res.status(404).send("Pedido no encontrado");
+    }
+
+    const bufferQR = await generarQRPedido({
+      pedidoId: pedido._id.toString(),
+      fecha: pedido.fecha,
+      hora: pedido.hora || "12:00",
+      telefono: pedido.telefono,
+    });
+
+    res.setHeader("Content-Type", "image/png");
+    res.send(bufferQR);
+  } catch (error) {
+    console.error("❌ Error generando QR:", error);
+    res.status(500).send("Error generando QR");
   }
 });
 
