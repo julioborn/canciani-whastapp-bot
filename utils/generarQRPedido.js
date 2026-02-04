@@ -1,6 +1,16 @@
 const QRCode = require("qrcode");
-const { createCanvas, loadImage } = require("canvas");
+const { createCanvas, loadImage, registerFont } = require("canvas");
 const path = require("path");
+
+registerFont(
+    path.join(__dirname, "../assets/fonts/Roboto-Bold.ttf"),
+    { family: "RobotoBold" }
+);
+
+registerFont(
+    path.join(__dirname, "../assets/fonts/Roboto-Regular.ttf"),
+    { family: "RobotoRegular" }
+);
 
 const dayNameES = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 
@@ -70,8 +80,9 @@ module.exports = async function generarQRPedido({ pedidoId, fecha, hora }) {
     // TEXTO FECHA
     // ======================
     ctx.fillStyle = "#000";
-    ctx.font = "bold 28px Arial";
+    ctx.font = "28px RobotoBold";
     ctx.textAlign = "center";
+    ctx.textBaseline = "top";
 
     ctx.fillText(
         formatearFecha(fecha),
@@ -82,7 +93,7 @@ module.exports = async function generarQRPedido({ pedidoId, fecha, hora }) {
     // ======================
     // TEXTO HORA
     // ======================
-    ctx.font = "24px Arial";
+    ctx.font = "24px RobotoRegular";
     ctx.fillText(
         `${hora} hs`,
         width / 2,
