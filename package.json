@@ -1,0 +1,15 @@
+{
+  "name": "Canciani-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Starter bot for WhatsApp Business API (360dialog)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "mongoose": "^8.21.0",
+    "node-fetch": "^2.6.9"
+  }
+}
