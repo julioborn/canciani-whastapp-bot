@@ -27,6 +27,8 @@ const DIAS_ADELANTE = Number(process.env.DIAS_ADELANTE || 21);
 
 // 🧠 Sesiones en memoria
 const sessions = {};
+// ⏱️ Tiempo máximo de inactividad antes de “dormir” la sesión (ej: 10 min)
+const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
 // ======================
 // HELPERS FECHA/HORA
@@ -147,6 +149,33 @@ async function processWebhook(body) {
 
   const from = message.from;
 
+  const messageType = message.type;
+  const isUserMessage = messageType === "text" || messageType === "interactive";
+
+  // 🛑 Si estaba salido o finalizado, SOLO despertar si el usuario escribe
+  if (
+    sessions[from] &&
+    (sessions[from].step === "salido" || sessions[from].step === "finalizado")
+  ) {
+    if (!isUserMessage) {
+      // evento viejo / delivery / status
+      return;
+    }
+
+    // 🔄 RESET TOTAL DE SESIÓN
+    delete sessions[from];
+  }
+
+  // ⏱️ Timeout por inactividad: si pasó mucho tiempo, dormir sesión
+  if (sessions[from]?.lastAction) {
+    const inactiveMs = Date.now() - sessions[from].lastAction;
+
+    if (inactiveMs > SESSION_TIMEOUT_MS) {
+      sessions[from] = { step: "salido", lastAction: Date.now() };
+      return;
+    }
+  }
+
   // 🔒 Estado bot
   const config = await Config.findOne();
   if (config?.botActivo === false) {
@@ -161,6 +190,7 @@ async function processWebhook(body) {
     sessions[from] = {
       step: cliente ? "menu" : "pedir_nombre_cliente",
       cliente,
+      lastAction: Date.now(),
     };
 
     if (!cliente) {
@@ -172,11 +202,6 @@ async function processWebhook(body) {
     }
 
     await sendMainMenu(from);
-    return;
-  }
-
-  // 🛑 BLOQUEO DE EVENTOS TARDÍOS / DUPLICADOS
-  if (sessions[from]?.step === "finalizado") {
     return;
   }
 
@@ -192,6 +217,9 @@ async function processWebhook(body) {
   }
 
   if (!rawId) return;
+
+  // ✅ Cada interacción válida refresca actividad
+  if (sessions[from]) sessions[from].lastAction = Date.now();
 
   let id = rawId.trim().toUpperCase();
 
@@ -262,14 +290,18 @@ async function processWebhook(body) {
     return;
   }
 
-  if (id === "MENU_SALIR" && sessions[from]?.step === "menu") {
-    delete sessions[from];
+  if (id === "MENU_SALIR") {
+    sessions[from] = { step: "salido", lastAction: Date.now() };
     await sendText(from, "👋 Gracias por escribirnos. ¡Te esperamos!");
     return;
   }
 
   if (id === "VOLVER_MENU") {
-    sessions[from] = { step: "menu" };
+    sessions[from] = {
+      ...(sessions[from] || {}),
+      step: "menu",
+      lastAction: Date.now(),
+    };
     await sendMainMenu(from);
     return;
   }
@@ -335,13 +367,19 @@ async function processWebhook(body) {
   // ======================
   if (id === "CONFIRMAR_PEDIDO") {
     await finalizarPedido(from);
-    // bloquear sesión brevemente
-    sessions[from] = { step: "finalizado" };
+    sessions[from] = {
+      step: "finalizado",
+      lastAction: Date.now(),
+    };
     return;
   }
 
   if (id === "CANCELAR_PEDIDO") {
-    sessions[from] = { step: "menu" };
+    sessions[from] = {
+      ...(sessions[from] || {}),
+      step: "menu",
+      lastAction: Date.now(),
+    };
     await sendMainMenu(from);
     return;
   }
@@ -360,7 +398,7 @@ async function sendMainMenu(to) {
     buttons: [
       { id: "MENU_PEDIR", title: "🥩 Hacer pedido" },
       //{ id: "MENU_HORARIOS", title: "🕒 Ver horarios" },
-      { id: "MENU_SALIR", title: "❌ Salir" },
+      //{ id: "MENU_SALIR", title: "❌ Salir" },
     ],
   });
 }
@@ -594,7 +632,7 @@ async function finalizarPedido(to) {
     `🕒 Hora: *${hora}*`
   );
 
-  await sendMainMenu(to);
+  //await sendMainMenu(to);
 }
 
 async function wabaFetch(payload) {
