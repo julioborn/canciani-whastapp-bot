@@ -677,6 +677,26 @@ async function sendBackButton(to) {
 }
 
 // ======================
+// 👉 WEBHOOK VERIFICATION (OBLIGATORIO)
+// ======================
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (
+    mode === "subscribe" &&
+    token === process.env.WEBHOOK_VERIFY_TOKEN
+  ) {
+    console.log("✅ Webhook verificado correctamente");
+    return res.status(200).send(challenge);
+  }
+
+  console.log("❌ Falló verificación webhook");
+  return res.sendStatus(403);
+});
+
+// ======================
 // 👉 WEBHOOK (RESPUESTA INMEDIATA)
 // ======================
 app.post("/webhook", (req, res) => {
