@@ -363,6 +363,11 @@ async function processWebhook(body) {
     return;
   }
 
+  if (id === "AGREGAR_MAS") {
+    await showProductos(from);
+    return;
+  }
+
   if (id.startsWith("PROD_")) {
     const productoId = id.replace("PROD_", "");
     const producto = await Producto.findById(productoId);
@@ -389,7 +394,21 @@ async function processWebhook(body) {
     }
 
     await sendText(from, `➕ *${producto.nombre}* agregado`);
-    await showProductos(from);
+    const resumen = sessions[from].items
+      .map(i => `• ${i.nombre} x${i.cantidad}`)
+      .join("\n");
+
+    await sendText(
+      from,
+      "🛒 *Tu pedido hasta ahora:*\n" + resumen
+    );
+    await sendButtons(from, {
+      body: "¿Qué querés hacer ahora?",
+      buttons: [
+        { id: "AGREGAR_MAS", title: "➕ Agregar otro producto" },
+        { id: "FIN_PRODUCTOS", title: "✅ Finalizar pedido" },
+      ],
+    });
     return;
   }
 
@@ -831,14 +850,11 @@ async function showProductos(to) {
     description: p.requiereTurno ? "Requiere turno" : "Retiro en el día",
   }));
 
-  rows.push({
-    id: "FIN_PRODUCTOS",
-    title: "✅ Continuar",
-    description: "Seguir con el pedido",
-  });
-
   await sendList(to, {
-    body: "🥩 Elegí los productos (podés seleccionar varios)",
+    body:
+      "🥩 *Elegí tus productos*\n\n" +
+      "👉 Seleccioná *uno por vez*.\n" +
+      "👉 Cada vez que elijas uno, podés *sumar otro* o *finalizar el pedido*.",
     buttonText: "Ver productos",
     sectionTitle: "Productos",
     rows,
