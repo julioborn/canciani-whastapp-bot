@@ -405,8 +405,8 @@ async function processWebhook(body) {
     await sendButtons(from, {
       body: "¿Qué querés hacer ahora?",
       buttons: [
-        { id: "AGREGAR_MAS", title: "➕ Agregar otro producto" },
-        { id: "FIN_PRODUCTOS", title: "✅ Finalizar pedido" },
+        { id: "AGREGAR_MAS", title: "➕ Agregar más" },      // ✅ 13 chars
+        { id: "FIN_PRODUCTOS", title: "✅ Finalizar" },     // ✅ 10 chars
       ],
     });
     return;
