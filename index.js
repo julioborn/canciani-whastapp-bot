@@ -9,10 +9,10 @@ const connectMongo = require("./db/mongo");
 const Config = require("./models/Config");
 const Stock = require("./models/Stock");
 const Horario = require("./models/Horario");
-const PedidoDesposte = require("./models/PedidoDesposte");
-const PedidoRetiro = require("./models/PedidoRetiro");
 const Cliente = require("./models/Cliente");
 const generarQRPedido = require("./utils/generarQRPedido");
+const Producto = require("./models/Producto");
+const Pedido = require("./models/Pedido");
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -34,41 +34,31 @@ const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 // ======================
 // HELPERS FECHA/HORA
 // ======================
-
 const pad2 = (n) => String(n).padStart(2, "0");
-
 const isoDate = (d) =>
   `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-
 const addDaysISO = (iso, days) => {
   const [y, m, d] = iso.split("-").map(Number);
   const dt = new Date(y, m - 1, d);
   dt.setDate(dt.getDate() + days);
   return isoDate(dt);
 };
-
 function dateFromISO(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(y, m - 1, d, 12, 0, 0, 0);
 }
-
 const todayISO = () => isoDate(new Date(new Date().setHours(12, 0, 0, 0)));
-
 const nowHHMM = () => {
   const d = new Date();
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
-
 const isHoraFutura = (hhmm) => hhmm >= nowHHMM();
-
 const dayNameES = (d) => ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"][d.getDay()];
-
 const labelFecha = (iso) => {
   const [y, m, d] = iso.split("-").map(Number);
   const dt = new Date(y, m - 1, d, 12, 0, 0, 0);
   return `${dayNameES(dt)} ${pad2(d)}/${pad2(m)}`;
 };
-
 const getInteractiveId = (message) => {
   if (message?.type !== "interactive") return null;
   return (
@@ -77,6 +67,32 @@ const getInteractiveId = (message) => {
     null
   );
 };
+
+// ======================
+// HELPERS TEXTO / VALIDACIONES
+// ======================
+function capitalizarNombre(texto) {
+  return texto
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .map(
+      (p) => p.charAt(0).toUpperCase() + p.slice(1)
+    )
+    .join(" ");
+}
+function normalizarEmpresa(texto) {
+  return texto.trim().toUpperCase();
+}
+function soloNumeros(texto) {
+  return texto.replace(/\D/g, "");
+}
+function validarDNI(dni) {
+  return /^\d{7,8}$/.test(dni);
+}
+function validarCUIT(cuit) {
+  return /^\d{11}$/.test(cuit);
+}
 
 // ======================
 // HELPERS FECHAS DINÁMICAS (NUEVO)
@@ -105,7 +121,6 @@ function getFechasPermitidas() {
 
   return fechas;
 }
-
 async function getFechasConHorario() {
   const fechas = getFechasPermitidas();
   const plantillas = await Horario.find();
@@ -113,7 +128,6 @@ async function getFechasConHorario() {
 
   return fechas.filter(f => diasDisponibles.includes(f.dia));
 }
-
 async function diaTieneDisponibilidad(fechaISO, modo) {
   const fecha = dateFromISO(fechaISO);
   const dia = fecha.getDay();
@@ -134,11 +148,20 @@ async function diaTieneDisponibilidad(fechaISO, modo) {
   // 👉 DESPOSTE: sí bloquea horarios
   let horas = plantilla.horas;
 
-  const pedidos = await PedidoDesposte.find({ fecha: fechaISO });
+  const pedidos = await Pedido.find({
+    fecha: fechaISO,
+    tipoPedido: "TURNO",
+  });
   const horasOcupadas = pedidos.map(p => p.hora);
   const libres = horas.filter(h => !horasOcupadas.includes(h));
 
   return libres.length > 0;
+}
+
+function calcularTipoPedido(items) {
+  return items.some(i => i.requiereTurno)
+    ? "TURNO"
+    : "RETIRO_DIA";
 }
 
 // ======================
@@ -225,9 +248,6 @@ async function processWebhook(body) {
   let id = rawId.trim().toUpperCase();
 
   // ---- MAPEOS ----
-  if (["CANT_1", "1 MEDIA RES", "UNA MEDIA RES"].includes(id)) id = "CANT_1";
-  if (["CANT_2", "2 MEDIAS RESES", "DOS MEDIAS RESES"].includes(id)) id = "CANT_2";
-
   if (id === "HACER PEDIDO") id = "MENU_PEDIR";
   if (id === "VER HORARIOS") id = "MENU_HORARIOS";
   if (id === "SALIR") id = "MENU_SALIR";
@@ -241,19 +261,55 @@ async function processWebhook(body) {
   // 3️⃣ Nombre del cliente (PRIMERA VEZ)
   // ======================
   if (sessions[from]?.step === "pedir_nombre_cliente") {
-    const nombre = rawId.trim();
+    const texto = rawId.trim();
+
+    sessions[from].nombreRaw = texto;
+    sessions[from].step = "pedir_documento";
+
+    await sendText(
+      from,
+      "🧾 ¿Podés indicarme tu *DNI* o *CUIT/CUIL*?\n\n" +
+      "• DNI: 7 u 8 números\n" +
+      "• CUIT/CUIL: 11 números"
+    );
+    return;
+  }
+
+  if (sessions[from]?.step === "pedir_documento") {
+    const doc = soloNumeros(rawId);
+
+    if (!validarDNI(doc) && !validarCUIT(doc)) {
+      await sendText(
+        from,
+        "❌ Documento inválido.\n" +
+        "• DNI: 7 u 8 números\n" +
+        "• CUIT/CUIL: 11 números\n\n" +
+        "Intentá nuevamente."
+      );
+      return;
+    }
+
+    const nombreRaw = sessions[from].nombreRaw;
+
+    const esEmpresa = validarCUIT(doc);
+    const nombreFinal = esEmpresa
+      ? normalizarEmpresa(nombreRaw)
+      : capitalizarNombre(nombreRaw);
 
     const cliente = await Cliente.create({
       telefono: from,
-      nombre,
+      nombre: nombreFinal,
+      documento: doc,
+      tipoDocumento: esEmpresa ? "CUIT" : "DNI",
     });
 
     sessions[from] = {
       step: "menu",
       cliente,
+      lastAction: Date.now(),
     };
 
-    await sendText(from, `¡Gracias *${nombre}*! 👍`);
+    await sendText(from, `¡Gracias *${nombreFinal}*! 👍`);
     await sendMainMenu(from);
     return;
   }
@@ -262,8 +318,7 @@ async function processWebhook(body) {
   // 5️⃣ Quién retira (SIEMPRE)
   // ======================
   if (sessions[from]?.step === "pedir_quien_retira") {
-    const nombreRetira = rawId.trim();
-
+    const nombreRetira = capitalizarNombre(rawId.trim());
     sessions[from].retira = nombreRetira;
     sessions[from].step = "esperando_confirmacion";
 
@@ -280,8 +335,9 @@ async function processWebhook(body) {
   // ROUTER
   // ======================
   if (id === "MENU_PEDIR") {
-    sessions[from].step = "cantidad";
-    await showCantidad(from);
+    sessions[from].items = [];
+    sessions[from].step = "productos";
+    await showProductos(from);
     return;
   }
 
@@ -307,20 +363,52 @@ async function processWebhook(body) {
     return;
   }
 
-  // ======================
-  // Cantidad
-  // ======================
-  // ======================
-  // Cantidad
-  // ======================
-  if (id.startsWith("CANT_")) {
-    sessions[from].cantidad = Number(id.replace("CANT_", ""));
-    sessions[from].step = "tipo";
+  if (id.startsWith("PROD_")) {
+    const productoId = id.replace("PROD_", "");
+    const producto = await Producto.findById(productoId);
 
-    // 🔑 TEXTO INTERMEDIO (CLAVE)
-    //await sendText(from, "Perfecto 👍");
+    if (!producto || !producto.activo) {
+      await sendText(from, "❌ Producto no disponible.");
+      return;
+    }
 
-    await showTipoRetiro(from);
+    const existente = sessions[from].items.find(
+      i => i.productoId.toString() === producto._id.toString()
+    );
+
+    if (existente) {
+      existente.cantidad += 1;
+    } else {
+      sessions[from].items.push({
+        productoId: producto._id,
+        nombre: producto.nombre,
+        cantidad: 1,
+        precioKg: producto.precioKg,
+        requiereTurno: producto.requiereTurno,
+      });
+    }
+
+    await sendText(from, `➕ *${producto.nombre}* agregado`);
+    await showProductos(from);
+    return;
+  }
+
+  if (id === "FIN_PRODUCTOS") {
+    if (!sessions[from].items.length) {
+      await sendText(from, "❌ Tenés que elegir al menos un producto.");
+      return;
+    }
+
+    const tipoPedido = calcularTipoPedido(sessions[from].items);
+    sessions[from].tipoPedido = tipoPedido;
+    sessions[from].step = "fecha";
+
+    if (tipoPedido === "TURNO") {
+      await showFechasDisponibles(from, { modo: "desposte" });
+    } else {
+      await showFechasDisponibles(from, { modo: "retiro" });
+    }
+
     return;
   }
 
@@ -343,7 +431,7 @@ async function processWebhook(body) {
     const fecha = id.replace("FECHA_", "");
     sessions[from].fecha = fecha;
 
-    if (sessions[from].tipoRetiro === "retiro") {
+    if (sessions[from].tipoPedido === "RETIRO_DIA") {
       sessions[from].hora = "12:00";
       sessions[from].step = "pedir_quien_retira";
       await sendText(from, "👤 ¿Quién va a retirar el pedido?");
@@ -400,17 +488,6 @@ async function sendMainMenu(to) {
       { id: "MENU_PEDIR", title: "🥩 Hacer pedido" },
       //{ id: "MENU_HORARIOS", title: "🕒 Ver horarios" },
       //{ id: "MENU_SALIR", title: "❌ Salir" },
-    ],
-  });
-}
-
-async function showCantidad(to) {
-  await sendButtons(to, {
-    body: "🥩 ¿Cuántas medias reses querés?",
-    buttons: [
-      { id: "CANT_1", title: "1 media res" },
-      { id: "CANT_2", title: "2 medias reses" },
-      { id: "VOLVER_MENU", title: "⬅️ Volver" },
     ],
   });
 }
@@ -507,7 +584,10 @@ async function showHorasDisponibles(to, fechaISO) {
     horas = horas.filter(h => isHoraFutura(h));
   }
 
-  const pedidos = await PedidoDesposte.find({ fecha: fechaISO });
+  const pedidos = await Pedido.find({
+    fecha: fechaISO,
+    tipoPedido: "TURNO",
+  });
   const ocupadas = pedidos.map(p => p.hora);
   const libres = horas.filter(h => !ocupadas.includes(h));
 
@@ -537,29 +617,22 @@ async function showHorasDisponibles(to, fechaISO) {
 // ======================
 async function showConfirmacion(to) {
   const s = sessions[to];
-  const cantidad = Number(s?.cantidad || 1);
-  const tipo = s?.tipoRetiro;
+  const tipoPedido = s?.tipoPedido;
   const fecha = s?.fecha;
   const hora = s?.hora;
-
-  const stock = await Stock.findOne();
-  const precioUnitario = stock?.precio ?? 0;
-  const precioTotal = precioUnitario * cantidad;
-
   const tipoTexto =
-    tipo === "desposte" ? "👀 Presenciar" : "📦 Retirar";
+    tipoPedido === "TURNO"
+      ? "👀 Presenciar desposte"
+      : "📦 Retiro (08:00 a 12:00)";
 
   await sendButtons(to, {
     body:
       `✅ *Confirmá tu pedido*\n\n` +
       `👤 Cliente: *${sessions[to].cliente.nombre}*\n` +
       `📦 Retira: *${sessions[to].retira}*\n\n` +
-      `🥩 Cantidad: *${cantidad}*\n` +
       `🔪 Modalidad: *${tipoTexto}*\n` +
       `📅 Día: *${labelFecha(fecha)}*\n` +
-      `🕒 Hora: *${hora}*\n\n` +
-      `💰 Total: *$${precioTotal}*\n\n` +
-      `ℹ️ El pago se realiza al retirar.`,
+      `🕒 Hora: *${hora}*\n\n`,
     buttons: [
       { id: "CONFIRMAR_PEDIDO", title: "✅ Confirmar" },
       { id: "CANCELAR_PEDIDO", title: "❌ Cancelar" },
@@ -573,36 +646,53 @@ async function showConfirmacion(to) {
 // ======================
 async function finalizarPedido(to) {
   const s = sessions[to];
-  const cantidad = Number(s?.cantidad || 1);
-  const tipoRetiro = s?.tipoRetiro;
   const fecha = s?.fecha;
   const hora = s?.hora || "12:00";
 
-  const stock = await Stock.findOne();
-  if (!stock) {
-    await sendText(to, "❌ Error interno de stock.");
-    return;
+  const items = sessions[to].items;
+  const tipoPedido = sessions[to].tipoPedido;
+
+  // ✅ 3) Validaciones de turno/hora
+  if (tipoPedido === "TURNO") {
+    if (!hora) {
+      await sendText(to, "❌ Falta hora para un pedido con turno.");
+      return;
+    }
   }
 
-  const precioUnitario = stock.precio;
-  const precioTotal = precioUnitario * cantidad;
+  // ✅ 4) Chequear y descontar stock por UNIDADES (no kilos)
+  // (si mañana agregás costillar/salamín, se descuenta cada uno)
+  for (const it of items) {
+    const p = await Producto.findById(it.productoId);
+    if (!p || !p.activo) {
+      await sendText(to, `❌ Producto no disponible: ${it.nombre}`);
+      return;
+    }
+    if (p.stock < it.cantidad) {
+      await sendText(to, `❌ No hay stock suficiente de ${p.nombre}.`);
+      return;
+    }
+  }
 
-  let pedido; // 👈 CLAVE: una sola variable
+  // ✅ 5) Crear pedido v2
+  let pedido;
+  try {
+    pedido = await Pedido.create({
+      telefono: to,
+      nombreCliente: sessions[to].cliente.nombre,
+      retira: { nombre: sessions[to].retira },
 
-  if (tipoRetiro === "desposte") {
-    // 🥩 TURNO DE DESPOSTE → bloquea horario
-    try {
-      pedido = await PedidoDesposte.create({
-        telefono: to,
-        nombreCliente: sessions[to].cliente.nombre,
-        cantidad,
-        fecha,
-        hora,
-        precioUnitario,
-        precioTotal,
-        retira: { nombre: sessions[to].retira },
-      });
-    } catch (e) {
+      fecha,
+      hora: tipoPedido === "TURNO" ? hora : undefined,
+
+      tipoPedido,
+      items,
+
+      estado: "RESERVADO",
+    });
+  } catch (e) {
+    // si chocó el índice único de TURNO
+    if (tipoPedido === "TURNO") {
       await sendText(
         to,
         "❌ Ese horario acaba de ser tomado por otro cliente. Elegí otro por favor."
@@ -610,48 +700,40 @@ async function finalizarPedido(to) {
       await showHorasDisponibles(to, fecha);
       return;
     }
-  } else {
-    // 📦 RETIRO → NO bloquea horarios
-    pedido = await PedidoRetiro.create({
-      telefono: to,
-      nombreCliente: sessions[to].cliente.nombre,
-      cantidad,
-      fecha,
-      hora, // 👈 lo guardamos igual para unificar
-      precioUnitario,
-      precioTotal,
-      retira: { nombre: sessions[to].retira },
-    });
+    console.error(e);
+    await sendText(to, "❌ Error interno creando el pedido.");
+    return;
   }
 
-  // ======================
-  // DESCONTAR STOCK
-  // ======================
-  stock.disponible -= cantidad;
-  await stock.save();
+  // ✅ 6) Descontar stock (unidades)
+  for (const it of items) {
+    await Producto.findByIdAndUpdate(it.productoId, { $inc: { stock: -it.cantidad } });
+  }
 
-  // ======================
-  // MENSAJE CONFIRMACIÓN
-  // ======================
+  const tipoTexto =
+    tipoPedido === "TURNO"
+      ? "👀 Presenciar desposte"
+      : "📦 Retiro (08:00 a 12:00)";
+
   await sendText(
     to,
     `✅ *Pedido reservado con éxito*\n\n` +
-    `🥩 Cantidad: *${cantidad}*\n` +
-    `🔪 Modalidad: *${tipoRetiro === "desposte" ? "👀 Presenciar desposte" : "📦 Retirar despostada"}*\n` +
-    `📅 Día: *${labelFecha(fecha)}*\n` +
-    `🕒 Hora: *${hora}*`
+    `👤 Cliente: *${sessions[to].cliente.nombre}*\n` +
+    `📦 Retira: *${sessions[to].retira}*\n\n` +
+    `🧾 Productos:\n` +
+    items.map(i => `• ${i.nombre} x${i.cantidad}`).join("\n") +
+    `\n\n📅 Día: *${labelFecha(fecha)}*\n` +
+    (tipoPedido === "TURNO" ? `🕒 Turno: *${hora}*\n` : `🕒 Retiro: *08:00 a 12:00*\n`) +
+    `\n💬 *El precio final se calcula al retirar según los kilos reales.*`
   );
 
-  // ======================
-  // 📸 PASO 4.3 → GENERAR + ENVIAR QR
-  // ======================
-
+  // ✅ 8) QR (igual que antes, pero ahora apunta al Pedido v2)
   await wabaFetch({
     messaging_product: "whatsapp",
     to,
     type: "image",
     image: {
-      link: `https://canciani-whatsapp-bot-production.up.railway.app/qr/${pedido._id}`
+      link: `https://canciani-whatsapp-bot-production.up.railway.app/qr/${pedido._id}`,
     },
   });
 
@@ -740,6 +822,29 @@ async function sendBackButton(to) {
   });
 }
 
+async function showProductos(to) {
+  const productos = await Producto.find({ activo: true });
+
+  const rows = productos.map((p) => ({
+    id: `PROD_${p._id}`,
+    title: p.nombre,
+    description: p.requiereTurno ? "Requiere turno" : "Retiro en el día",
+  }));
+
+  rows.push({
+    id: "FIN_PRODUCTOS",
+    title: "✅ Continuar",
+    description: "Seguir con el pedido",
+  });
+
+  await sendList(to, {
+    body: "🥩 Elegí los productos (podés seleccionar varios)",
+    buttonText: "Ver productos",
+    sectionTitle: "Productos",
+    rows,
+  });
+}
+
 // ======================
 // 👉 WEBHOOK VERIFICATION (OBLIGATORIO)
 // ======================
@@ -797,9 +902,7 @@ app.get("/qr/:pedidoId", async (req, res) => {
   try {
     const { pedidoId } = req.params;
 
-    const pedido =
-      (await PedidoDesposte.findById(pedidoId)) ||
-      (await PedidoRetiro.findById(pedidoId));
+    const pedido = await Pedido.findById(pedidoId);
 
     if (!pedido) {
       return res.status(404).send("Pedido no encontrado");
@@ -831,4 +934,66 @@ app.get("/", (req, res) => {
   res.status(200).send("OK BOT CANCIANI ✅");
 });
 
+// ======================
+// 🔍 ADMIN - VER PEDIDO POR QR
+// ======================
+app.get("/admin/pedidos/:id", async (req, res) => {
+  const pedido = await Pedido.findById(req.params.id)
+    .populate("items.productoId");
+
+  if (!pedido) {
+    return res.status(404).json({ error: "Pedido no encontrado" });
+  }
+
+  res.json(pedido);
+});
+
+// ======================
+// ✅ ADMIN - CERRAR PEDIDO POR QR
+// ======================
+app.post("/admin/pedidos/:id/cerrar", async (req, res) => {
+  const { items } = req.body;
+  // items = [{ productoId, kilos }]
+
+  const pedido = await Pedido.findById(req.params.id);
+  if (!pedido) {
+    return res.status(404).json({ error: "Pedido no encontrado" });
+  }
+
+  let total = 0;
+
+  pedido.items = pedido.items.map(item => {
+    const data = items.find(
+      i => i.productoId === item.productoId.toString()
+    );
+
+    const kilos = Number(data?.kilos || 0);
+    const subtotal = kilos * item.precioKg;
+
+    total += subtotal;
+
+    return {
+      ...item.toObject(),
+      kilosReales: kilos,
+      subtotal,
+    };
+  });
+
+  pedido.precioFinal = total;
+  pedido.estado = "ENTREGADO";
+
+  await pedido.save();
+
+  // 📲 WhatsApp final
+  await sendText(
+    pedido.telefono,
+    `✅ *Pedido entregado*\n\n` +
+    pedido.items
+      .map(i => `• ${i.nombre}: ${i.kilosReales} kg → $${i.subtotal}`)
+      .join("\n") +
+    `\n\n💰 Total: *$${pedido.precioFinal}*\n\n¡Gracias por tu compra! 🥩`
+  );
+
+  res.json({ ok: true, total });
+});
 
