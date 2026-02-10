@@ -3,7 +3,7 @@ process.on("uncaughtException", console.error);
 
 require("dotenv").config();
 const express = require("express");
-//const fetch = global.fetch || require("node-fetch");
+const fetch = global.fetch || require("node-fetch");
 
 const connectMongo = require("./db/mongo");
 const Config = require("./models/Config");
@@ -19,6 +19,11 @@ app.use(express.json());
 connectMongo();
 
 const redis = require("./lib/redis");
+
+// ======================
+// ⏱️ TIMERS DE INACTIVIDAD (MEMORIA)
+// ======================
+const inactivityTimers = new Map();
 
 const sessionKey = (phone) => `session:${phone}`;
 
@@ -40,14 +45,62 @@ async function deleteSession(phone) {
   await redis.del(sessionKey(phone));
 }
 
+function clearInactivityTimers(phone) {
+  const timers = inactivityTimers.get(phone);
+  if (!timers) return;
+
+  clearTimeout(timers.warning);
+  clearTimeout(timers.reset);
+  inactivityTimers.delete(phone);
+}
+
+function scheduleInactivityTimers(phone) {
+  clearInactivityTimers(phone);
+
+  // ⏰ WARNING
+  const warning = setTimeout(async () => {
+    const session = await getSession(phone);
+    if (!session) return;
+    if (!STEPS_CON_RELOJ.has(session.step)) return;
+    if (session.warned) return;
+
+    session.warned = true;
+    await setSession(phone, session);
+    await sendText(phone, "⏰ ¿Seguís ahí?");
+  }, SESSION_WARNING_MS);
+
+  // ⌛ RESET TOTAL
+  const reset = setTimeout(async () => {
+    const session = await getSession(phone);
+    if (!session) return;
+    if (!STEPS_CON_RELOJ.has(session.step)) return;
+
+    clearInactivityTimers(phone);
+    await deleteSession(phone);
+    await sendText(phone, "👋 Bienvenido a *Canciani Carnes*");
+  }, SESSION_TIMEOUT_MS);
+
+  inactivityTimers.set(phone, { warning, reset });
+}
+
 // ======================
 // CONFIG
 // ======================
 const DIAS_ADELANTE = Number(process.env.DIAS_ADELANTE || 21);
 
+const STEPS_CON_RELOJ = new Set([
+  "productos",
+  "cantidad",
+  "fecha",
+  "tipo_retiro",
+  "pedir_quien_retira",
+  "quien_retira_opcion",
+  "esperando_confirmacion",
+]);
+
 // ⏱️ Tiempo máximo de inactividad antes de “dormir” la sesión (ej: 10 min)
 const SESSION_WARNING_MS = 5 * 60 * 1000; // “¿seguís ahí?”
-const SESSION_TIMEOUT_MS = 8 * 60 * 1000; // reset total
+const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // reset total
 
 // ======================
 // HELPERS FECHA/HORA
@@ -188,35 +241,13 @@ async function processWebhook(body) {
   // 🛑 Si estaba salido o finalizado, SOLO despertar si el usuario escribe
   let session = await getSession(from);
 
-  if (session) {
-    const idle = Date.now() - session.lastAction;
-
-    // ⚠️ Aviso previo
-    if (!session.warned && idle > SESSION_WARNING_MS) {
-      session.warned = true;
-      await setSession(from, session);
-      await sendText(from, "⏰ ¿Seguís ahí?");
-      return;
-    }
-
-    // ⌛ Timeout total
-    if (idle > SESSION_TIMEOUT_MS) {
-      await deleteSession(from);
-      await sendText(
-        from,
-        "⌛ La sesión expiró por inactividad.\nEscribí nuevamente para empezar."
-      );
-      return;
-    }
-  }
-
   if (!session) {
     const cliente = await Cliente.findOne({ telefono: from });
     session = {
       step: cliente ? "menu" : "pedir_nombre_cliente",
       cliente,
       items: [],
-      lastAction: Date.now(),
+      lastAction: Date.now(), // 👈 esto es CLAVE
       warned: false,
     };
     await setSession(from, session);
@@ -233,6 +264,7 @@ async function processWebhook(body) {
   // 🔒 Estado bot
   const config = await Config.findOne();
   if (config?.botActivo === false) {
+    clearInactivityTimers(from);
     await sendText(from, config.mensajeCerrado || "❌ No hay pedidos disponibles.");
     return;
   }
@@ -307,6 +339,10 @@ async function processWebhook(body) {
     session.warned = false;
     session.lastAction = Date.now();
     await setSession(from, session);
+  }
+
+  if (session && STEPS_CON_RELOJ.has(session.step)) {
+    scheduleInactivityTimers(from);
   }
 
   // ---- MAPEOS ----
@@ -424,7 +460,11 @@ async function processWebhook(body) {
   if (id === "MENU_PEDIR") {
     session.items = [];
     session.step = "productos";
+    session.warned = false;
+    session.lastAction = Date.now();
+
     await setSession(from, session);
+    scheduleInactivityTimers(from); // 👈 ACÁ ARRANCA EL RELOJ
     await showProductos(from);
     return;
   }
@@ -437,6 +477,7 @@ async function processWebhook(body) {
   }
 
   if (id === "MENU_SALIR") {
+    clearInactivityTimers(from);
     session = { step: "salido", lastAction: Date.now() };
     await setSession(from, session);
     await sendText(from, "👋 Gracias por escribirnos. ¡Te esperamos!");
@@ -444,6 +485,7 @@ async function processWebhook(body) {
   }
 
   if (id === "VOLVER_MENU") {
+    clearInactivityTimers(from);
     session.step = "menu";
     session.lastAction = Date.now();
     await setSession(from, session);
@@ -669,6 +711,7 @@ async function processWebhook(body) {
   // Confirmar
   // ======================
   if (id === "CONFIRMAR_PEDIDO") {
+    clearInactivityTimers(from);
     await finalizarPedido(from);
     session = { step: "finalizado", lastAction: Date.now() };
     await setSession(from, session);
@@ -676,6 +719,7 @@ async function processWebhook(body) {
   }
 
   if (id === "CANCELAR_PEDIDO") {
+    clearInactivityTimers(from);
     session.step = "menu";
     session.lastAction = Date.now();
     await setSession(from, session);
