@@ -66,10 +66,16 @@ function scheduleInactivityTimers(phone) {
 
     session.warned = true;
     await setSession(phone, session);
-    await sendText(phone, "⏰ ¿Seguís ahí?");
+    await sendButtons(phone, {
+      body: "⏰ ¿Seguís ahí?",
+      buttons: [
+        { id: "SEGUIR_PEDIDO", title: "▶️ Seguir pedido" },
+        { id: "CANCELAR_INACTIVIDAD", title: "❌ Cancelar" },
+      ],
+    });
   }, SESSION_WARNING_MS);
 
-  // ⌛ RESET TOTAL
+  // ⌛ RESET TOTAL POR INACTIVIDAD
   const reset = setTimeout(async () => {
     const session = await getSession(phone);
     if (!session) return;
@@ -77,7 +83,13 @@ function scheduleInactivityTimers(phone) {
 
     clearInactivityTimers(phone);
     await deleteSession(phone);
-    await sendText(phone, "👋 Bienvenido a *Canciani Carnes*");
+
+    await sendText(
+      phone,
+      "⏳ *Sesión finalizada por inactividad.*\n\nTe dejamos el menú para empezar de nuevo 👇"
+    );
+
+    await sendMainMenu(phone);
   }, SESSION_TIMEOUT_MS);
 
   inactivityTimers.set(phone, { warning, reset });
@@ -285,54 +297,96 @@ async function processWebhook(body) {
   let id = rawId.trim().toUpperCase();
 
   // ======================
-  // 💤 Respuesta al "¿Seguís ahí?"
+  // ⏰ RESPUESTA A INACTIVIDAD
   // ======================
-  if (session?.warned && message.type === "text") {
+  if (id === "SEGUIR_PEDIDO") {
     session.warned = false;
     session.lastAction = Date.now();
     await setSession(from, session);
 
-    await sendText(from, "👍 Perfecto, seguimos.");
-
     // 🔁 Reanudar flujo según step actual
-    const step = session.step;
-
-    if (step === "productos") {
-      await showProductos(from);
-      return;
-    }
-
-    if (step === "cantidad") {
-      const prod = session.productoPendiente;
-      if (prod) {
-        await sendText(from, "🔢 Decime la cantidad que querés.");
-      } else {
-        session.step = "productos";
-        await setSession(from, session);
+    switch (session.step) {
+      case "productos":
         await showProductos(from);
-      }
-      return;
+        break;
+
+      case "cantidad":
+        await sendText(from, "🔢 Decime la cantidad que querés.");
+        break;
+
+      case "fecha":
+        await showFechasDisponibles(from, { modo: session.tipoRetiro });
+        break;
+
+      case "pedir_quien_retira":
+        await sendText(from, "👤 ¿Quién va a retirar el pedido?");
+        break;
+
+      default:
+        await sendMainMenu(from);
     }
 
-    if (step === "menu") {
-      await sendMainMenu(from);
-      return;
-    }
+    return;
+  }
 
-    if (step === "fecha") {
-      await showFechasDisponibles(from, { modo: session.tipoRetiro });
-      return;
-    }
+  if (id === "CANCELAR_INACTIVIDAD") {
+    clearInactivityTimers(from);
+    await deleteSession(from);
 
-    if (step === "pedir_quien_retira") {
-      await sendText(from, "👤 ¿Quién va a retirar el pedido?");
-      return;
-    }
-
-    // fallback seguro
+    await sendText(from, "❌ Pedido cancelado. Volvemos al inicio.");
     await sendMainMenu(from);
     return;
   }
+
+  // ======================
+  // 💤 Respuesta al "¿Seguís ahí?"
+  // ======================
+  // if (session?.warned && message.type === "text") {
+  //   session.warned = false;
+  //   session.lastAction = Date.now();
+  //   await setSession(from, session);
+
+  //   await sendText(from, "👍 Perfecto, seguimos.");
+
+  //   // 🔁 Reanudar flujo según step actual
+  //   const step = session.step;
+
+  //   if (step === "productos") {
+  //     await showProductos(from);
+  //     return;
+  //   }
+
+  //   if (step === "cantidad") {
+  //     const prod = session.productoPendiente;
+  //     if (prod) {
+  //       await sendText(from, "🔢 Decime la cantidad que querés.");
+  //     } else {
+  //       session.step = "productos";
+  //       await setSession(from, session);
+  //       await showProductos(from);
+  //     }
+  //     return;
+  //   }
+
+  //   if (step === "menu") {
+  //     await sendMainMenu(from);
+  //     return;
+  //   }
+
+  //   if (step === "fecha") {
+  //     await showFechasDisponibles(from, { modo: session.tipoRetiro });
+  //     return;
+  //   }
+
+  //   if (step === "pedir_quien_retira") {
+  //     await sendText(from, "👤 ¿Quién va a retirar el pedido?");
+  //     return;
+  //   }
+
+  //   // fallback seguro
+  //   await sendMainMenu(from);
+  //   return;
+  // }
 
   // ✅ Cada interacción válida refresca actividad
   if (session) {
@@ -341,8 +395,16 @@ async function processWebhook(body) {
     await setSession(from, session);
   }
 
-  if (session && STEPS_CON_RELOJ.has(session.step)) {
-    scheduleInactivityTimers(from);
+  const IDS_INACTIVIDAD = ["SEGUIR_PEDIDO", "CANCELAR_INACTIVIDAD"];
+
+  if (session && !IDS_INACTIVIDAD.includes(id)) {
+    session.warned = false;
+    session.lastAction = Date.now();
+    await setSession(from, session);
+
+    if (STEPS_CON_RELOJ.has(session.step)) {
+      scheduleInactivityTimers(from);
+    }
   }
 
   // ---- MAPEOS ----
@@ -622,8 +684,8 @@ async function processWebhook(body) {
       body: "¿Qué querés hacer ahora?",
       buttons: [
         { id: "AGREGAR_MAS", title: "➕ Agregar productos" },
-        { id: "FIN_PRODUCTOS", title: "✅ Finalizar" },
-        { id: "VACIAR_CARRITO", title: "🗑️ Vaciar" },
+        { id: "FIN_PRODUCTOS", title: "✅ Finalizar pedido" },
+        { id: "VACIAR_CARRITO", title: "🗑️ Vaciar carrito" },
       ],
     });
 
