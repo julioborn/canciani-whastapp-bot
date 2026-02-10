@@ -38,6 +38,12 @@ setInterval(async () => {
 
   for (const from of Object.keys(sessions)) {
     const s = sessions[from];
+
+    // 🚫 No vigilar sesiones cerradas
+    if (s.step === "salido" || s.step === "finalizado") {
+      continue;
+    }
+
     if (!s?.lastAction) continue;
 
     const inactiveMs = now - s.lastAction;
@@ -62,13 +68,17 @@ setInterval(async () => {
       sessions[from] = {
         step: "salido",
         lastAction: now,
+        warned: false,
       };
 
       await sendText(
         from,
         "⛔ El pedido se reinició por inactividad.\n\n" +
+        "👋 Bienvenido a *CANCIANI CARNES*\n" +
         "Cuando quieras, podés empezar uno nuevo 👍"
       );
+
+      await sendMainMenu(from);
     }
   }
 }, 30 * 1000); // 👈 cada 30 segundos
@@ -269,12 +279,28 @@ async function processWebhook(body) {
 
   if (!rawId) return;
 
+  let id = rawId.trim().toUpperCase();
+
+  // ======================
+  // 💤 Respuesta al "¿Seguís ahí?"
+  // ======================
+  if (
+    sessions[from]?.warned &&
+    message.type === "text"
+  ) {
+    sessions[from].warned = false;
+    sessions[from].lastAction = Date.now();
+
+    await sendText(from, "👍 Perfecto, seguimos.");
+
+    return; // ⛔ no pasa al router
+  }
+
   // ✅ Cada interacción válida refresca actividad
   if (sessions[from]) {
     sessions[from].lastAction = Date.now();
     sessions[from].warned = false; // 👈 reset del aviso
   }
-  let id = rawId.trim().toUpperCase();
 
   // ---- MAPEOS ----
   if (id === "HACER PEDIDO") id = "MENU_PEDIR";
