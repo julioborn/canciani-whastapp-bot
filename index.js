@@ -402,7 +402,7 @@ async function processWebhook(body) {
     sessions[from].step = "cantidad";
 
     await sendButtons(from, {
-      body: `🔢 ¿Cuántos *${producto.nombre}* querés?`,
+      body: textoCantidad(producto),
       buttons: [
         { id: "CANT_1", title: "1" },
         { id: "CANT_2", title: "2" },
@@ -465,7 +465,9 @@ async function processWebhook(body) {
     } else {
       sessions[from].items.push({
         productoId: prod.productoId,
-        nombre: prod.nombre,
+        nombre: productoDB.nombre,
+        nombrePlural: productoDB.nombrePlural,
+        genero: productoDB.genero,
         cantidad,
         precioKg: prod.precioKg,
         requiereTurno: prod.requiereTurno,
@@ -475,10 +477,16 @@ async function processWebhook(body) {
     sessions[from].productoPendiente = null;
     sessions[from].step = "productos";
 
-    await sendText(from, `➕ *${prod.nombre}* agregado x${cantidad}`);
+    const nombreItem = nombrePorCantidad(productoDB, cantidad);
+
+    const item = sessions[from].items.find(
+      i => i.productoId.toString() === prod.productoId.toString()
+    );
+
+    await sendText(from, textoAgregado(item, cantidad));
 
     const resumen = sessions[from].items
-      .map(i => `• ${i.nombre} x${i.cantidad}`)
+      .map(i => `• ${i.cantidad} ${nombrePorCantidad(i, i.cantidad)}`)
       .join("\n");
 
     await sendText(from, "🛒 *Tu pedido hasta ahora:*\n" + resumen);
@@ -486,7 +494,7 @@ async function processWebhook(body) {
     await sendButtons(from, {
       body: "¿Qué querés hacer ahora?",
       buttons: [
-        { id: "AGREGAR_MAS", title: "➕ Agregar más" },
+        { id: "AGREGAR_MAS", title: "➕ Agregar productos" },
         { id: "FIN_PRODUCTOS", title: "✅ Finalizar" },
         { id: "VACIAR_CARRITO", title: "🗑️ Vaciar" },
       ],
@@ -509,6 +517,19 @@ async function processWebhook(body) {
       return;
     }
 
+    const requiereTurno = sessions[from].items.some(i => i.requiereTurno);
+
+    // 🥩 SI NO REQUIERE TURNO → RETIRO DIRECTO
+    if (!requiereTurno) {
+      sessions[from].tipoPedido = "RETIRO_DIA";
+      sessions[from].tipoRetiro = "retiro";
+      sessions[from].step = "fecha";
+
+      await showFechasDisponibles(from, { modo: "retiro" });
+      return;
+    }
+
+    // 🔪 SI REQUIERE TURNO → PREGUNTAR MODALIDAD
     sessions[from].step = "tipo_retiro";
     await showTipoRetiro(from);
     return;
@@ -600,7 +621,7 @@ async function sendMainMenu(to) {
 
 async function showTipoRetiro(to) {
   await sendList(to, {
-    body: "🔪 ¿Cómo querés recibir la media res?",
+    body: "🔪 ¿Cómo querés recibir tu pedido?",
     buttonText: "Elegir opción",
     sectionTitle: "Modalidad",
     rows: [
@@ -612,10 +633,31 @@ async function showTipoRetiro(to) {
       {
         id: "TIPO_RETIRO",
         title: "Retirar despostada",
-        description: "Retiro en el día (08:00 a 12:00)",
+        description: "Retiro en el día (08:00 a 12:00 hs)",
       },
     ],
   });
+}
+
+function textoCantidad(producto) {
+  const articulo =
+    producto.genero === "femenino" ? "Cuántas" : "Cuántos";
+
+  const nombre =
+    producto.nombrePlural || producto.nombre;
+
+  return `🔢 ¿${articulo} *${nombre}* querés?`;
+}
+
+function nombrePorCantidad(item, cantidad) {
+  if (cantidad === 1) return item.nombre;
+  return item.nombrePlural || item.nombre;
+}
+
+function textoAgregado(item, cantidad) {
+  const nombre = nombrePorCantidad(item, cantidad);
+  const verbo = item.genero === "femenino" ? "agregada" : "agregado";
+  return `➕ *${cantidad} ${nombre}* ${verbo}`;
 }
 
 // ======================
@@ -828,7 +870,9 @@ async function finalizarPedido(to) {
     `👤 Cliente: *${sessions[to].cliente.nombre}*\n` +
     `📦 Retira: *${sessions[to].retira}*\n\n` +
     `🧾 Productos:\n` +
-    items.map(i => `• ${i.nombre} x${i.cantidad}`).join("\n") +
+    items
+      .map(i => `• ${i.cantidad} ${nombrePorCantidad(i, i.cantidad)}`)
+      .join("\n") +
     `\n\n📅 Día: *${labelFecha(fecha)}*\n` +
     (tipoPedido === "TURNO" ? `🕒 Turno: *${hora}*\n` : `🕒 Retiro: *08:00 a 12:00*\n`) +
     `\n💬 *El precio final se calcula al retirar según los kilos reales.*`
@@ -967,7 +1011,7 @@ async function showProductos(to) {
       title: safeTitle(sinStock ? `⛔ ${p.nombre}` : p.nombre),
       description: sinStock
         ? "Sin stock"
-        : (p.requiereTurno ? "Requiere turno" : "Retiro en el día (08-12)"),
+        : (p.requiereTurno ? "Requiere turno" : "Retiro en el día (08-12 hs)"),
     };
   });
 
@@ -1126,7 +1170,14 @@ app.post("/admin/pedidos/:id/cerrar", async (req, res) => {
     pedido.telefono,
     `✅ *Pedido entregado*\n\n` +
     pedido.items
-      .map(i => `• ${i.nombre}: ${i.kilosReales} kg → $${i.subtotal}`)
+      .map(i => {
+        const nombre =
+          i.kilosReales === 1
+            ? i.nombre
+            : (i.nombrePlural || i.nombre);
+
+        return `• ${nombre}: ${i.kilosReales} kg → $${i.subtotal}`;
+      })
       .join("\n") +
     `\n\n💰 Total: *$${pedido.precioFinal}*\n\n¡Gracias por tu compra! 🥩`
   );

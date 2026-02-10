@@ -3,8 +3,14 @@ const mongoose = require("mongoose");
 const ProductoSchema = new mongoose.Schema(
     {
         nombre: { type: String, required: true, trim: true },
-        descripcion: { type: String, default: "" },
+        nombrePlural: { type: String }, // 👈 nuevo
+        genero: {
+            type: String,
+            enum: ["masculino", "femenino"],
+            default: "masculino",
+        },
 
+        descripcion: { type: String, default: "" },
         precioKg: { type: Number, required: true, min: 0 },
         stock: { type: Number, required: true, min: 0 },
 
@@ -16,4 +22,5 @@ const ProductoSchema = new mongoose.Schema(
 
 ProductoSchema.index({ nombre: 1 }, { unique: true });
 
-module.exports = mongoose.models.Producto || mongoose.model("Producto", ProductoSchema);
+module.exports =
+    mongoose.models.Producto || mongoose.model("Producto", ProductoSchema);
