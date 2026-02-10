@@ -3,7 +3,7 @@ process.on("uncaughtException", console.error);
 
 require("dotenv").config();
 const express = require("express");
-const fetch = global.fetch || require("node-fetch");
+//const fetch = global.fetch || require("node-fetch");
 
 const connectMongo = require("./db/mongo");
 const Config = require("./models/Config");
@@ -18,64 +18,36 @@ app.use(express.json());
 
 connectMongo();
 
+const redis = require("./lib/redis");
+
+const sessionKey = (phone) => `session:${phone}`;
+
+async function getSession(phone) {
+  const data = await redis.get(sessionKey(phone));
+  return data ? JSON.parse(data) : null;
+}
+
+async function setSession(phone, value) {
+  await redis.set(
+    sessionKey(phone),
+    JSON.stringify(value),
+    "EX",
+    60 * 15 // 15 minutos
+  );
+}
+
+async function deleteSession(phone) {
+  await redis.del(sessionKey(phone));
+}
+
 // ======================
 // CONFIG
 // ======================
 const DIAS_ADELANTE = Number(process.env.DIAS_ADELANTE || 21);
 
-// 🧠 Sesiones en memoria
-const sessions = {};
-
 // ⏱️ Tiempo máximo de inactividad antes de “dormir” la sesión (ej: 10 min)
 const SESSION_WARNING_MS = 5 * 60 * 1000; // “¿seguís ahí?”
 const SESSION_TIMEOUT_MS = 8 * 60 * 1000; // reset total
-
-// ======================
-// ⏱️ WATCHDOG DE SESIONES
-// ======================
-setInterval(async () => {
-  const now = Date.now();
-
-  for (const from of Object.keys(sessions)) {
-    const s = sessions[from];
-
-    // 🚫 No vigilar sesiones cerradas
-    if (s.step === "salido" || s.step === "finalizado") {
-      continue;
-    }
-
-    if (!s?.lastAction) continue;
-
-    const inactiveMs = now - s.lastAction;
-
-    // ⏱️ Aviso previo
-    if (
-      inactiveMs > SESSION_WARNING_MS &&
-      inactiveMs < SESSION_TIMEOUT_MS &&
-      !s.warned
-    ) {
-      s.warned = true;
-
-      await sendText(
-        from,
-        "⏳ ¿Seguís ahí?\n\n" +
-        "Si no respondés, el pedido se va a reiniciar automáticamente."
-      );
-    }
-
-    // ⛔ Reset total (MATA la sesión)
-    if (inactiveMs >= SESSION_TIMEOUT_MS) {
-      delete sessions[from];
-
-      await sendText(
-        from,
-        "⛔ El pedido se reinició por inactividad.\n\n" +
-        "👋 Cuando quieras, podés empezar uno nuevo 👍"
-      );
-    }
-
-  }
-}, 30 * 1000); // 👈 cada 30 segundos
 
 // ======================
 // HELPERS FECHA/HORA
@@ -213,50 +185,55 @@ async function processWebhook(body) {
 
   const from = message.from;
 
-  const messageType = message.type;
-  const isUserMessage = messageType === "text" || messageType === "interactive";
-
   // 🛑 Si estaba salido o finalizado, SOLO despertar si el usuario escribe
-  if (
-    sessions[from] &&
-    (sessions[from].step === "salido" || sessions[from].step === "finalizado")
-  ) {
-    if (!isUserMessage) {
-      // evento viejo / delivery / status
+  let session = await getSession(from);
+
+  if (session) {
+    const idle = Date.now() - session.lastAction;
+
+    // ⚠️ Aviso previo
+    if (!session.warned && idle > SESSION_WARNING_MS) {
+      session.warned = true;
+      await setSession(from, session);
+      await sendText(from, "⏰ ¿Seguís ahí?");
       return;
     }
 
-    // 🔄 RESET TOTAL DE SESIÓN
-    delete sessions[from];
+    // ⌛ Timeout total
+    if (idle > SESSION_TIMEOUT_MS) {
+      await deleteSession(from);
+      await sendText(
+        from,
+        "⌛ La sesión expiró por inactividad.\nEscribí nuevamente para empezar."
+      );
+      return;
+    }
+  }
+
+  if (!session) {
+    const cliente = await Cliente.findOne({ telefono: from });
+    session = {
+      step: cliente ? "menu" : "pedir_nombre_cliente",
+      cliente,
+      items: [],
+      lastAction: Date.now(),
+      warned: false,
+    };
+    await setSession(from, session);
+
+    if (!cliente) {
+      await sendText(from, "👋 Antes de empezar, ¿podés decirme tu *nombre completo o empresa*?");
+      return;
+    }
+
+    await sendMainMenu(from);
+    return;
   }
 
   // 🔒 Estado bot
   const config = await Config.findOne();
   if (config?.botActivo === false) {
     await sendText(from, config.mensajeCerrado || "❌ No hay pedidos disponibles.");
-    return;
-  }
-
-  // 🧠 Inicializar sesión
-  if (!sessions[from]) {
-    const cliente = await Cliente.findOne({ telefono: from });
-
-    sessions[from] = {
-      step: cliente ? "menu" : "pedir_nombre_cliente",
-      cliente,
-      lastAction: Date.now(),
-      warned: false, // 👈 ACÁ
-    };
-
-    if (!cliente) {
-      await sendText(
-        from,
-        "👋 Antes de empezar, ¿podés decirme tu *nombre completo o empresa*?"
-      );
-      return;
-    }
-
-    await sendMainMenu(from);
     return;
   }
 
@@ -278,14 +255,15 @@ async function processWebhook(body) {
   // ======================
   // 💤 Respuesta al "¿Seguís ahí?"
   // ======================
-  if (sessions[from]?.warned && message.type === "text") {
-    sessions[from].warned = false;
-    sessions[from].lastAction = Date.now();
+  if (session?.warned && message.type === "text") {
+    session.warned = false;
+    session.lastAction = Date.now();
+    await setSession(from, session);
 
     await sendText(from, "👍 Perfecto, seguimos.");
 
     // 🔁 Reanudar flujo según step actual
-    const step = sessions[from].step;
+    const step = session.step;
 
     if (step === "productos") {
       await showProductos(from);
@@ -293,9 +271,13 @@ async function processWebhook(body) {
     }
 
     if (step === "cantidad") {
-      const prod = sessions[from].productoPendiente;
+      const prod = session.productoPendiente;
       if (prod) {
         await sendText(from, "🔢 Decime la cantidad que querés.");
+      } else {
+        session.step = "productos";
+        await setSession(from, session);
+        await showProductos(from);
       }
       return;
     }
@@ -306,7 +288,7 @@ async function processWebhook(body) {
     }
 
     if (step === "fecha") {
-      await showFechasDisponibles(from, { modo: sessions[from].tipoRetiro });
+      await showFechasDisponibles(from, { modo: session.tipoRetiro });
       return;
     }
 
@@ -321,9 +303,10 @@ async function processWebhook(body) {
   }
 
   // ✅ Cada interacción válida refresca actividad
-  if (sessions[from]) {
-    sessions[from].lastAction = Date.now();
-    sessions[from].warned = false; // 👈 reset del aviso
+  if (session) {
+    session.warned = false;
+    session.lastAction = Date.now();
+    await setSession(from, session);
   }
 
   // ---- MAPEOS ----
@@ -339,11 +322,12 @@ async function processWebhook(body) {
   // ======================
   // 3️⃣ Nombre del cliente (PRIMERA VEZ)
   // ======================
-  if (sessions[from]?.step === "pedir_nombre_cliente") {
+  if (session.step === "pedir_nombre_cliente") {
     const texto = rawId.trim();
 
-    sessions[from].nombreRaw = texto;
-    sessions[from].step = "pedir_documento";
+    session.nombreRaw = texto;
+    session.step = "pedir_documento";
+    await setSession(from, session);
 
     await sendText(
       from,
@@ -354,7 +338,7 @@ async function processWebhook(body) {
     return;
   }
 
-  if (sessions[from]?.step === "pedir_documento") {
+  if (session.step === "pedir_documento") {
     const doc = soloNumeros(rawId);
 
     if (!validarDNI(doc) && !validarCUIT(doc)) {
@@ -368,7 +352,7 @@ async function processWebhook(body) {
       return;
     }
 
-    const nombreRaw = sessions[from].nombreRaw;
+    const nombreRaw = session.nombreRaw;
 
     const esEmpresa = validarCUIT(doc);
     const nombreFinal = esEmpresa
@@ -382,29 +366,34 @@ async function processWebhook(body) {
       tipoDocumento: esEmpresa ? "CUIT" : "DNI",
     });
 
-    sessions[from] = {
+    session = {
       step: "menu",
       cliente,
+      items: [],
       lastAction: Date.now(),
       warned: false,
     };
+
+    await setSession(from, session);
 
     await sendText(from, `¡Gracias *${nombreFinal}*! 👍`);
     await sendMainMenu(from);
     return;
   }
 
-  if (sessions[from]?.step === "quien_retira_opcion") {
+  if (session.step === "quien_retira_opcion") {
     if (id === "RETIRA_ULTIMO") {
-      const nombreRetira = sessions[from].cliente.ultimoRetira;
-      sessions[from].retira = nombreRetira;
-      sessions[from].step = "esperando_confirmacion";
+      const nombreRetira = session.cliente.ultimoRetira;
+      session.retira = nombreRetira;
+      session.step = "esperando_confirmacion";
+      await setSession(from, session);
       await showConfirmacion(from);
       return;
     }
 
     if (id === "RETIRA_OTRO") {
-      sessions[from].step = "pedir_quien_retira";
+      session.step = "pedir_quien_retira";
+      await setSession(from, session);
       await sendText(from, "👤 Escribí el nombre de quien retira:");
       return;
     }
@@ -413,16 +402,18 @@ async function processWebhook(body) {
   // ======================
   // 5️⃣ Quién retira (SIEMPRE)
   // ======================
-  if (sessions[from]?.step === "pedir_quien_retira") {
+  if (session.step === "pedir_quien_retira") {
     const nombreRetira = capitalizarNombre(rawId.trim());
-    sessions[from].retira = nombreRetira;
-    sessions[from].step = "esperando_confirmacion";
+
+    session.retira = nombreRetira;
+    session.step = "esperando_confirmacion";
 
     await Cliente.findOneAndUpdate(
       { telefono: from },
       { ultimoRetira: nombreRetira }
     );
 
+    await setSession(from, session);
     await showConfirmacion(from);
     return;
   }
@@ -431,30 +422,31 @@ async function processWebhook(body) {
   // ROUTER
   // ======================
   if (id === "MENU_PEDIR") {
-    sessions[from].items = [];
-    sessions[from].step = "productos";
+    session.items = [];
+    session.step = "productos";
+    await setSession(from, session);
     await showProductos(from);
     return;
   }
 
   if (id === "MENU_HORARIOS") {
-    sessions[from].step = "ver_horarios";
+    session.step = "ver_horarios";
+    await setSession(from, session);
     await showFechasDisponibles(from, { modo: "general" });
     return;
   }
 
   if (id === "MENU_SALIR") {
-    sessions[from] = { step: "salido", lastAction: Date.now() };
+    session = { step: "salido", lastAction: Date.now() };
+    await setSession(from, session);
     await sendText(from, "👋 Gracias por escribirnos. ¡Te esperamos!");
     return;
   }
 
   if (id === "VOLVER_MENU") {
-    sessions[from] = {
-      ...(sessions[from] || {}),
-      step: "menu",
-      lastAction: Date.now(),
-    };
+    session.step = "menu";
+    session.lastAction = Date.now();
+    await setSession(from, session);
     await sendMainMenu(from);
     return;
   }
@@ -481,14 +473,15 @@ async function processWebhook(body) {
     }
 
     // Guardamos producto pendiente para pedir cantidad
-    sessions[from].productoPendiente = {
+    session.productoPendiente = {
       productoId: producto._id,
       nombre: producto.nombre,
       precioKg: producto.precioKg,
       requiereTurno: producto.requiereTurno,
     };
 
-    sessions[from].step = "cantidad";
+    session.step = "cantidad";
+    await setSession(from, session);
 
     await sendButtons(from, {
       body: textoCantidad(producto),
@@ -512,7 +505,7 @@ async function processWebhook(body) {
   // ======================
   // Cantidad de producto
   // ======================
-  if (sessions[from]?.step === "cantidad") {
+  if (session.step === "cantidad") {
     let cantidad = null;
 
     if (id === "CANT_1") cantidad = 1;
@@ -528,10 +521,11 @@ async function processWebhook(body) {
       cantidad = n;
     }
 
-    const prod = sessions[from].productoPendiente;
+    const prod = session.productoPendiente;
     if (!prod) {
       await sendText(from, "❌ Error interno. Volvamos a empezar.");
-      sessions[from].step = "productos";
+      session.step = "productos";
+      await setSession(from, session);
       await showProductos(from);
       return;
     }
@@ -539,20 +533,21 @@ async function processWebhook(body) {
     const productoDB = await Producto.findById(prod.productoId);
     if (!productoDB || !productoDB.activo || productoDB.stock < cantidad) {
       await sendText(from, `❌ No hay stock suficiente de *${prod.nombre}*.`);
-      sessions[from].productoPendiente = null;
-      sessions[from].step = "productos";
+      session.productoPendiente = null;
+      session.step = "productos";
+      await setSession(from, session);
       await showProductos(from);
       return;
     }
 
-    const existente = sessions[from].items.find(
+    const existente = session.items.find(
       i => i.productoId.toString() === prod.productoId.toString()
     );
 
     if (existente) {
       existente.cantidad += cantidad;
     } else {
-      sessions[from].items.push({
+      session.items.push({
         productoId: prod.productoId,
         nombre: productoDB.nombre,
         nombrePlural: productoDB.nombrePlural,
@@ -563,18 +558,19 @@ async function processWebhook(body) {
       });
     }
 
-    sessions[from].productoPendiente = null;
-    sessions[from].step = "productos";
+    session.productoPendiente = null;
+    session.step = "productos";
+    await setSession(from, session);
 
     const nombreItem = nombrePorCantidad(productoDB, cantidad);
 
-    const item = sessions[from].items.find(
+    const item = session.items.find(
       i => i.productoId.toString() === prod.productoId.toString()
     );
 
     await sendText(from, textoAgregado(item, cantidad));
 
-    const resumen = sessions[from].items
+    const resumen = session.items
       .map(i => `• ${i.cantidad} ${nombrePorCantidad(i, i.cantidad)}`)
       .join("\n");
 
@@ -593,33 +589,35 @@ async function processWebhook(body) {
   }
 
   if (id === "VACIAR_CARRITO") {
-    sessions[from].items = [];
+    session.items = [];
     await sendText(from, "🗑️ Carrito vaciado.");
-    sessions[from].step = "productos";
+    session.step = "productos";
+    await setSession(from, session);
     await showProductos(from);
     return;
   }
 
   if (id === "FIN_PRODUCTOS") {
-    if (!sessions[from].items.length) {
+    if (!session.items.length) {
       await sendText(from, "❌ Tenés que elegir al menos un producto.");
       return;
     }
 
-    const requiereTurno = sessions[from].items.some(i => i.requiereTurno);
+    const requiereTurno = session.items.some(i => i.requiereTurno);
 
     // 🥩 SI NO REQUIERE TURNO → RETIRO DIRECTO
     if (!requiereTurno) {
-      sessions[from].tipoPedido = "RETIRO_DIA";
-      sessions[from].tipoRetiro = "retiro";
-      sessions[from].step = "fecha";
-
+      session.tipoPedido = "RETIRO_DIA";
+      session.tipoRetiro = "retiro";
+      session.step = "fecha";
+      await setSession(from, session);
       await showFechasDisponibles(from, { modo: "retiro" });
       return;
+
     }
 
     // 🔪 SI REQUIERE TURNO → PREGUNTAR MODALIDAD
-    sessions[from].step = "tipo_retiro";
+    session.step = "tipo_retiro";
     await showTipoRetiro(from);
     return;
   }
@@ -630,14 +628,12 @@ async function processWebhook(body) {
   if (id === "TIPO_DESPOSTE" || id === "TIPO_RETIRO") {
     const esDesposte = id === "TIPO_DESPOSTE";
 
-    sessions[from].tipoPedido = esDesposte ? "TURNO" : "RETIRO_DIA";
-    sessions[from].tipoRetiro = esDesposte ? "desposte" : "retiro";
+    session.tipoPedido = esDesposte ? "TURNO" : "RETIRO_DIA";
+    session.tipoRetiro = esDesposte ? "desposte" : "retiro";
+    session.step = "fecha";
 
-    sessions[from].step = "fecha";
-
-    await showFechasDisponibles(from, {
-      modo: sessions[from].tipoRetiro,
-    });
+    await setSession(from, session);
+    await showFechasDisponibles(from, { modo: session.tipoRetiro });
     return;
   }
 
@@ -646,10 +642,11 @@ async function processWebhook(body) {
   // ======================
   if (id.startsWith("FECHA_")) {
     const fecha = id.replace("FECHA_", "");
-    sessions[from].fecha = fecha;
+    session.fecha = fecha;
 
-    if (sessions[from].tipoPedido === "RETIRO_DIA") {
-      sessions[from].hora = null; // importante
+    if (session.tipoPedido === "RETIRO_DIA") {
+      session.hora = null;
+      await setSession(from, session);
       await preguntarQuienRetira(from);
     } else {
       await showHorasDisponibles(from, fecha);
@@ -661,8 +658,9 @@ async function processWebhook(body) {
   // Hora
   // ======================
   if (id.startsWith("HORA_")) {
-    sessions[from].hora = id.replace("HORA_", "");
-    sessions[from].step = "pedir_quien_retira";
+    session.hora = id.replace("HORA_", "");
+    session.step = "pedir_quien_retira";
+    await setSession(from, session);
     await preguntarQuienRetira(from);
     return;
   }
@@ -672,19 +670,15 @@ async function processWebhook(body) {
   // ======================
   if (id === "CONFIRMAR_PEDIDO") {
     await finalizarPedido(from);
-    sessions[from] = {
-      step: "finalizado",
-      lastAction: Date.now(),
-    };
+    session = { step: "finalizado", lastAction: Date.now() };
+    await setSession(from, session);
     return;
   }
 
   if (id === "CANCELAR_PEDIDO") {
-    sessions[from] = {
-      ...(sessions[from] || {}),
-      step: "menu",
-      lastAction: Date.now(),
-    };
+    session.step = "menu";
+    session.lastAction = Date.now();
+    await setSession(from, session);
     await sendMainMenu(from);
     return;
   }
@@ -853,24 +847,28 @@ async function showHorasDisponibles(to, fechaISO) {
 // Confirmación
 // ======================
 async function showConfirmacion(to) {
-  const s = sessions[to];
+  const s = await getSession(to);
   const tipoPedido = s?.tipoPedido;
   const fecha = s?.fecha;
   const hora = s?.hora;
+
   const tipoTexto =
     tipoPedido === "TURNO"
       ? "👀 Presenciar desposte"
       : "📦 Retiro (08:00 a 12:00)";
+
   const esTurno = tipoPedido === "TURNO";
 
   await sendButtons(to, {
     body:
       `✅ *Confirmá tu pedido*\n\n` +
-      `👤 Cliente: *${sessions[to].cliente.nombre}*\n` +
-      `📦 Retira: *${sessions[to].retira}*\n\n` +
+      `👤 Cliente: *${s.cliente.nombre}*\n` +
+      `📦 Retira: *${s.retira}*\n\n` +
       `🔪 Modalidad: *${tipoTexto}*\n` +
       `📅 Día: *${labelFecha(fecha)}*\n` +
-      (esTurno ? `🕒 Turno: *${hora}*\n\n` : `🕒 Retiro: *08:00 a 12:00*\n\n`),
+      (esTurno
+        ? `🕒 Turno: *${hora}*\n\n`
+        : `🕒 Retiro: *08:00 a 12:00*\n\n`),
     buttons: [
       { id: "CONFIRMAR_PEDIDO", title: "✅ Confirmar" },
       { id: "CANCELAR_PEDIDO", title: "❌ Cancelar" },
@@ -883,12 +881,8 @@ async function showConfirmacion(to) {
 // Finalizar pedido (reserva turno + descuenta stock + guarda pedido)
 // ======================
 async function finalizarPedido(to) {
-  const s = sessions[to];
-  const fecha = s?.fecha;
-  const hora = s?.hora ?? null;
-
-  const items = sessions[to].items;
-  const tipoPedido = sessions[to].tipoPedido;
+  const session = await getSession(to);
+  const { fecha, hora, items, tipoPedido } = session;
 
   // ✅ 3) Validaciones de turno/hora
   if (tipoPedido === "TURNO") {
@@ -917,8 +911,8 @@ async function finalizarPedido(to) {
   try {
     pedido = await Pedido.create({
       telefono: to,
-      nombreCliente: sessions[to].cliente.nombre,
-      retira: { nombre: sessions[to].retira },
+      nombreCliente: session.cliente.nombre,
+      retira: { nombre: session.retira },
 
       fecha,
       hora: tipoPedido === "TURNO" ? hora : undefined,
@@ -956,8 +950,8 @@ async function finalizarPedido(to) {
   await sendText(
     to,
     `✅ *Pedido reservado con éxito*\n\n` +
-    `👤 Cliente: *${sessions[to].cliente.nombre}*\n` +
-    `📦 Retira: *${sessions[to].retira}*\n\n` +
+    `👤 Cliente: *${session.cliente.nombre}*\n` +
+    `📦 Retira: *${session.retira}*\n\n` +
     `🧾 Productos:\n` +
     items
       .map(i => `• ${i.cantidad} ${nombrePorCantidad(i, i.cantidad)}`)
@@ -1063,25 +1057,25 @@ async function sendBackButton(to) {
 }
 
 async function preguntarQuienRetira(to) {
-  const cliente = sessions[to]?.cliente;
+  const session = await getSession(to);
+  const cliente = session?.cliente;
 
   if (cliente?.ultimoRetira) {
-    const nombre = cliente.ultimoRetira;
-    const corto = safeTitle(nombre, 20);
-
-    sessions[to].step = "quien_retira_opcion";
+    session.step = "quien_retira_opcion";
+    await setSession(to, session);
 
     await sendButtons(to, {
-      body: `👤 ¿Quién va a retirar?\n\nÚltimo: *${nombre}*`,
+      body: `👤 ¿Quién va a retirar?\n\nÚltimo: *${cliente.ultimoRetira}*`,
       buttons: [
-        { id: "RETIRA_ULTIMO", title: `✅ ${corto}` },
+        { id: "RETIRA_ULTIMO", title: `✅ ${safeTitle(cliente.ultimoRetira)}` },
         { id: "RETIRA_OTRO", title: "✍️ Otra persona" },
       ],
     });
     return;
   }
 
-  sessions[to].step = "pedir_quien_retira";
+  session.step = "pedir_quien_retira";
+  await setSession(to, session);
   await sendText(to, "👤 ¿Quién va a retirar el pedido?");
 }
 
