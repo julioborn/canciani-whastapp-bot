@@ -63,23 +63,17 @@ setInterval(async () => {
       );
     }
 
-    // ⛔ Reset total
+    // ⛔ Reset total (MATA la sesión)
     if (inactiveMs >= SESSION_TIMEOUT_MS) {
-      sessions[from] = {
-        step: "salido",
-        lastAction: now,
-        warned: false,
-      };
+      delete sessions[from];
 
       await sendText(
         from,
         "⛔ El pedido se reinició por inactividad.\n\n" +
-        "👋 Bienvenido a *CANCIANI CARNES*\n" +
-        "Cuando quieras, podés empezar uno nuevo 👍"
+        "👋 Cuando quieras, podés empezar uno nuevo 👍"
       );
-
-      await sendMainMenu(from);
     }
+
   }
 }, 30 * 1000); // 👈 cada 30 segundos
 
@@ -284,16 +278,46 @@ async function processWebhook(body) {
   // ======================
   // 💤 Respuesta al "¿Seguís ahí?"
   // ======================
-  if (
-    sessions[from]?.warned &&
-    message.type === "text"
-  ) {
+  if (sessions[from]?.warned && message.type === "text") {
     sessions[from].warned = false;
     sessions[from].lastAction = Date.now();
 
     await sendText(from, "👍 Perfecto, seguimos.");
 
-    return; // ⛔ no pasa al router
+    // 🔁 Reanudar flujo según step actual
+    const step = sessions[from].step;
+
+    if (step === "productos") {
+      await showProductos(from);
+      return;
+    }
+
+    if (step === "cantidad") {
+      const prod = sessions[from].productoPendiente;
+      if (prod) {
+        await sendText(from, "🔢 Decime la cantidad que querés.");
+      }
+      return;
+    }
+
+    if (step === "menu") {
+      await sendMainMenu(from);
+      return;
+    }
+
+    if (step === "fecha") {
+      await showFechasDisponibles(from, { modo: sessions[from].tipoRetiro });
+      return;
+    }
+
+    if (step === "pedir_quien_retira") {
+      await sendText(from, "👤 ¿Quién va a retirar el pedido?");
+      return;
+    }
+
+    // fallback seguro
+    await sendMainMenu(from);
+    return;
   }
 
   // ✅ Cada interacción válida refresca actividad
