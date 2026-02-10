@@ -7,14 +7,11 @@ const fetch = global.fetch || require("node-fetch");
 
 const connectMongo = require("./db/mongo");
 const Config = require("./models/Config");
-const Stock = require("./models/Stock");
 const Horario = require("./models/Horario");
 const Cliente = require("./models/Cliente");
 const generarQRPedido = require("./utils/generarQRPedido");
 const Producto = require("./models/Producto");
 const Pedido = require("./models/Pedido");
-
-const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 const app = express();
 app.use(express.json());
@@ -156,12 +153,6 @@ async function diaTieneDisponibilidad(fechaISO, modo) {
   const libres = horas.filter(h => !horasOcupadas.includes(h));
 
   return libres.length > 0;
-}
-
-function calcularTipoPedido(items) {
-  return items.some(i => i.requiereTurno)
-    ? "TURNO"
-    : "RETIRO_DIA";
 }
 
 // ======================
@@ -314,6 +305,22 @@ async function processWebhook(body) {
     return;
   }
 
+  if (sessions[from]?.step === "quien_retira_opcion") {
+    if (id === "RETIRA_ULTIMO") {
+      const nombreRetira = sessions[from].cliente.ultimoRetira;
+      sessions[from].retira = nombreRetira;
+      sessions[from].step = "esperando_confirmacion";
+      await showConfirmacion(from);
+      return;
+    }
+
+    if (id === "RETIRA_OTRO") {
+      sessions[from].step = "pedir_quien_retira";
+      await sendText(from, "👤 Escribí el nombre de quien retira:");
+      return;
+    }
+  }
+
   // ======================
   // 5️⃣ Quién retira (SIEMPRE)
   // ======================
@@ -377,38 +384,122 @@ async function processWebhook(body) {
       return;
     }
 
+    // ✅ 5) Bloquear si no hay stock
+    if ((producto.stock ?? 0) <= 0) {
+      await sendText(from, `❌ *${producto.nombre}* está sin stock.`);
+      await showProductos(from);
+      return;
+    }
+
+    // Guardamos producto pendiente para pedir cantidad
+    sessions[from].productoPendiente = {
+      productoId: producto._id,
+      nombre: producto.nombre,
+      precioKg: producto.precioKg,
+      requiereTurno: producto.requiereTurno,
+    };
+
+    sessions[from].step = "cantidad";
+
+    await sendButtons(from, {
+      body: `🔢 ¿Cuántos *${producto.nombre}* querés?`,
+      buttons: [
+        { id: "CANT_1", title: "1" },
+        { id: "CANT_2", title: "2" },
+        { id: "CANT_3", title: "3" },
+      ],
+    });
+
+    await sendText(from, "✍️ Si querés más de 3, escribí el número (solo números).");
+    return;
+  }
+
+  if (id.startsWith("SINSTOCK_")) {
+    await sendText(from, "❌ Ese producto está sin stock en este momento.");
+    await showProductos(from);
+    return;
+  }
+
+  // ======================
+  // Cantidad de producto
+  // ======================
+  if (sessions[from]?.step === "cantidad") {
+    let cantidad = null;
+
+    if (id === "CANT_1") cantidad = 1;
+    if (id === "CANT_2") cantidad = 2;
+    if (id === "CANT_3") cantidad = 3;
+
+    if (cantidad === null) {
+      const n = Number(soloNumeros(rawId));
+      if (!Number.isFinite(n) || n <= 0) {
+        await sendText(from, "❌ Cantidad inválida. Escribí un número (ej: 4).");
+        return;
+      }
+      cantidad = n;
+    }
+
+    const prod = sessions[from].productoPendiente;
+    if (!prod) {
+      await sendText(from, "❌ Error interno. Volvamos a empezar.");
+      sessions[from].step = "productos";
+      await showProductos(from);
+      return;
+    }
+
+    const productoDB = await Producto.findById(prod.productoId);
+    if (!productoDB || !productoDB.activo || productoDB.stock < cantidad) {
+      await sendText(from, `❌ No hay stock suficiente de *${prod.nombre}*.`);
+      sessions[from].productoPendiente = null;
+      sessions[from].step = "productos";
+      await showProductos(from);
+      return;
+    }
+
     const existente = sessions[from].items.find(
-      i => i.productoId.toString() === producto._id.toString()
+      i => i.productoId.toString() === prod.productoId.toString()
     );
 
     if (existente) {
-      existente.cantidad += 1;
+      existente.cantidad += cantidad;
     } else {
       sessions[from].items.push({
-        productoId: producto._id,
-        nombre: producto.nombre,
-        cantidad: 1,
-        precioKg: producto.precioKg,
-        requiereTurno: producto.requiereTurno,
+        productoId: prod.productoId,
+        nombre: prod.nombre,
+        cantidad,
+        precioKg: prod.precioKg,
+        requiereTurno: prod.requiereTurno,
       });
     }
 
-    await sendText(from, `➕ *${producto.nombre}* agregado`);
+    sessions[from].productoPendiente = null;
+    sessions[from].step = "productos";
+
+    await sendText(from, `➕ *${prod.nombre}* agregado x${cantidad}`);
+
     const resumen = sessions[from].items
       .map(i => `• ${i.nombre} x${i.cantidad}`)
       .join("\n");
 
-    await sendText(
-      from,
-      "🛒 *Tu pedido hasta ahora:*\n" + resumen
-    );
+    await sendText(from, "🛒 *Tu pedido hasta ahora:*\n" + resumen);
+
     await sendButtons(from, {
       body: "¿Qué querés hacer ahora?",
       buttons: [
-        { id: "AGREGAR_MAS", title: "➕ Agregar más" },      // ✅ 13 chars
-        { id: "FIN_PRODUCTOS", title: "✅ Finalizar" },     // ✅ 10 chars
+        { id: "AGREGAR_MAS", title: "➕ Agregar más" },
+        { id: "FIN_PRODUCTOS", title: "✅ Finalizar" },
+        { id: "VACIAR_CARRITO", title: "🗑️ Vaciar" },
       ],
     });
+
+    return;
+  }
+
+  if (id === "VACIAR_CARRITO") {
+    sessions[from].items = [];
+    await sendText(from, "🗑️ Carrito vaciado.");
+    sessions[from].step = "productos";
+    await showProductos(from);
     return;
   }
 
@@ -418,16 +509,8 @@ async function processWebhook(body) {
       return;
     }
 
-    const tipoPedido = calcularTipoPedido(sessions[from].items);
-    sessions[from].tipoPedido = tipoPedido;
-    sessions[from].step = "fecha";
-
-    if (tipoPedido === "TURNO") {
-      await showFechasDisponibles(from, { modo: "desposte" });
-    } else {
-      await showFechasDisponibles(from, { modo: "retiro" });
-    }
-
+    sessions[from].step = "tipo_retiro";
+    await showTipoRetiro(from);
     return;
   }
 
@@ -435,8 +518,13 @@ async function processWebhook(body) {
   // Tipo retiro
   // ======================
   if (id === "TIPO_DESPOSTE" || id === "TIPO_RETIRO") {
-    sessions[from].tipoRetiro = id === "TIPO_DESPOSTE" ? "desposte" : "retiro";
+    const esDesposte = id === "TIPO_DESPOSTE";
+
+    sessions[from].tipoPedido = esDesposte ? "TURNO" : "RETIRO_DIA";
+    sessions[from].tipoRetiro = esDesposte ? "desposte" : "retiro";
+
     sessions[from].step = "fecha";
+
     await showFechasDisponibles(from, {
       modo: sessions[from].tipoRetiro,
     });
@@ -451,9 +539,8 @@ async function processWebhook(body) {
     sessions[from].fecha = fecha;
 
     if (sessions[from].tipoPedido === "RETIRO_DIA") {
-      sessions[from].hora = "12:00";
-      sessions[from].step = "pedir_quien_retira";
-      await sendText(from, "👤 ¿Quién va a retirar el pedido?");
+      sessions[from].hora = null; // importante
+      await preguntarQuienRetira(from);
     } else {
       await showHorasDisponibles(from, fecha);
     }
@@ -466,7 +553,7 @@ async function processWebhook(body) {
   if (id.startsWith("HORA_")) {
     sessions[from].hora = id.replace("HORA_", "");
     sessions[from].step = "pedir_quien_retira";
-    await sendText(from, "👤 ¿Quién va a retirar el pedido?");
+    await preguntarQuienRetira(from);
     return;
   }
 
@@ -525,7 +612,7 @@ async function showTipoRetiro(to) {
       {
         id: "TIPO_RETIRO",
         title: "Retirar despostada",
-        description: "Lista para retirar a las 12:00",
+        description: "Retiro en el día (08:00 a 12:00)",
       },
     ],
   });
@@ -569,7 +656,7 @@ async function showFechasDisponibles(to, { modo }) {
 
   const titulo =
     modo === "retiro"
-      ? "📅 Elegí el día (retiro a las 12:00)"
+      ? "📅 Elegí el día (retiro de 08:00 a 12:00)"
       : modo === "desposte"
         ? "📅 Elegí el día para presenciar el desposte"
         : "📅 Fechas con turnos disponibles";
@@ -643,6 +730,7 @@ async function showConfirmacion(to) {
     tipoPedido === "TURNO"
       ? "👀 Presenciar desposte"
       : "📦 Retiro (08:00 a 12:00)";
+  const esTurno = tipoPedido === "TURNO";
 
   await sendButtons(to, {
     body:
@@ -651,11 +739,11 @@ async function showConfirmacion(to) {
       `📦 Retira: *${sessions[to].retira}*\n\n` +
       `🔪 Modalidad: *${tipoTexto}*\n` +
       `📅 Día: *${labelFecha(fecha)}*\n` +
-      `🕒 Hora: *${hora}*\n\n`,
+      (esTurno ? `🕒 Turno: *${hora}*\n\n` : `🕒 Retiro: *08:00 a 12:00*\n\n`),
     buttons: [
       { id: "CONFIRMAR_PEDIDO", title: "✅ Confirmar" },
       { id: "CANCELAR_PEDIDO", title: "❌ Cancelar" },
-      { id: "VOLVER_MENU", title: "⬅️ Menú" },
+      { id: "VACIAR_CARRITO", title: "🗑️ Vaciar" },
     ],
   });
 }
@@ -666,7 +754,7 @@ async function showConfirmacion(to) {
 async function finalizarPedido(to) {
   const s = sessions[to];
   const fecha = s?.fecha;
-  const hora = s?.hora || "12:00";
+  const hora = s?.hora ?? null;
 
   const items = sessions[to].items;
   const tipoPedido = sessions[to].tipoPedido;
@@ -841,14 +929,47 @@ async function sendBackButton(to) {
   });
 }
 
+async function preguntarQuienRetira(to) {
+  const cliente = sessions[to]?.cliente;
+
+  if (cliente?.ultimoRetira) {
+    const nombre = cliente.ultimoRetira;
+    const corto = safeTitle(nombre, 20);
+
+    sessions[to].step = "quien_retira_opcion";
+
+    await sendButtons(to, {
+      body: `👤 ¿Quién va a retirar?\n\nÚltimo: *${nombre}*`,
+      buttons: [
+        { id: "RETIRA_ULTIMO", title: `✅ ${corto}` },
+        { id: "RETIRA_OTRO", title: "✍️ Otra persona" },
+      ],
+    });
+    return;
+  }
+
+  sessions[to].step = "pedir_quien_retira";
+  await sendText(to, "👤 ¿Quién va a retirar el pedido?");
+}
+
+function safeTitle(text, max = 24) {
+  return text.length > max ? text.slice(0, max - 1) + "…" : text;
+}
+
 async function showProductos(to) {
   const productos = await Producto.find({ activo: true });
 
-  const rows = productos.map((p) => ({
-    id: `PROD_${p._id}`,
-    title: p.nombre,
-    description: p.requiereTurno ? "Requiere turno" : "Retiro en el día",
-  }));
+  const rows = productos.map((p) => {
+    const sinStock = (p.stock ?? 0) <= 0;
+
+    return {
+      id: sinStock ? `SINSTOCK_${p._id}` : `PROD_${p._id}`,
+      title: safeTitle(sinStock ? `⛔ ${p.nombre}` : p.nombre),
+      description: sinStock
+        ? "Sin stock"
+        : (p.requiereTurno ? "Requiere turno" : "Retiro en el día (08-12)"),
+    };
+  });
 
   await sendList(to, {
     body:
@@ -927,7 +1048,7 @@ app.get("/qr/:pedidoId", async (req, res) => {
     const bufferQR = await generarQRPedido({
       pedidoId: pedido._id.toString(),
       fecha: pedido.fecha,
-      hora: pedido.hora || "12:00",
+      hora: pedido.hora || "08:00-12:00",
       telefono: pedido.telefono,
     });
 
