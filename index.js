@@ -25,9 +25,53 @@ const DIAS_ADELANTE = Number(process.env.DIAS_ADELANTE || 21);
 
 // 🧠 Sesiones en memoria
 const sessions = {};
+
 // ⏱️ Tiempo máximo de inactividad antes de “dormir” la sesión (ej: 10 min)
 const SESSION_WARNING_MS = 5 * 60 * 1000; // “¿seguís ahí?”
 const SESSION_TIMEOUT_MS = 8 * 60 * 1000; // reset total
+
+// ======================
+// ⏱️ WATCHDOG DE SESIONES
+// ======================
+setInterval(async () => {
+  const now = Date.now();
+
+  for (const from of Object.keys(sessions)) {
+    const s = sessions[from];
+    if (!s?.lastAction) continue;
+
+    const inactiveMs = now - s.lastAction;
+
+    // ⏱️ Aviso previo
+    if (
+      inactiveMs > SESSION_WARNING_MS &&
+      inactiveMs < SESSION_TIMEOUT_MS &&
+      !s.warned
+    ) {
+      s.warned = true;
+
+      await sendText(
+        from,
+        "⏳ ¿Seguís ahí?\n\n" +
+        "Si no respondés, el pedido se va a reiniciar automáticamente."
+      );
+    }
+
+    // ⛔ Reset total
+    if (inactiveMs >= SESSION_TIMEOUT_MS) {
+      sessions[from] = {
+        step: "salido",
+        lastAction: now,
+      };
+
+      await sendText(
+        from,
+        "⛔ El pedido se reinició por inactividad.\n\n" +
+        "Cuando quieras, podés empezar uno nuevo 👍"
+      );
+    }
+  }
+}, 30 * 1000); // 👈 cada 30 segundos
 
 // ======================
 // HELPERS FECHA/HORA
@@ -180,40 +224,6 @@ async function processWebhook(body) {
 
     // 🔄 RESET TOTAL DE SESIÓN
     delete sessions[from];
-  }
-
-  // ⏱️ Timeout por inactividad: si pasó mucho tiempo, dormir sesión
-  if (sessions[from]?.lastAction) {
-    const inactiveMs = Date.now() - sessions[from].lastAction;
-
-    // ⏱️ Aviso previo
-    if (
-      inactiveMs > SESSION_WARNING_MS &&
-      !sessions[from].warned
-    ) {
-      sessions[from].warned = true;
-
-      await sendText(
-        from,
-        "⏳ ¿Seguís ahí?\n\n" +
-        "Si no respondés, el pedido se va a reiniciar automáticamente."
-      );
-
-      return;
-    }
-
-    // ⛔ Reset total
-    if (inactiveMs > SESSION_TIMEOUT_MS) {
-      sessions[from] = { step: "salido", lastAction: Date.now() };
-
-      await sendText(
-        from,
-        "⛔ El pedido se reinició por inactividad.\n\n" +
-        "Cuando quieras, podés empezar uno nuevo 👍"
-      );
-
-      return;
-    }
   }
 
   // 🔒 Estado bot
