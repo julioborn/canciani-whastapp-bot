@@ -26,7 +26,8 @@ const DIAS_ADELANTE = Number(process.env.DIAS_ADELANTE || 21);
 // 🧠 Sesiones en memoria
 const sessions = {};
 // ⏱️ Tiempo máximo de inactividad antes de “dormir” la sesión (ej: 10 min)
-const SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+const SESSION_WARNING_MS = 5 * 60 * 1000; // “¿seguís ahí?”
+const SESSION_TIMEOUT_MS = 8 * 60 * 1000; // reset total
 
 // ======================
 // HELPERS FECHA/HORA
@@ -185,8 +186,32 @@ async function processWebhook(body) {
   if (sessions[from]?.lastAction) {
     const inactiveMs = Date.now() - sessions[from].lastAction;
 
+    // ⏱️ Aviso previo
+    if (
+      inactiveMs > SESSION_WARNING_MS &&
+      !sessions[from].warned
+    ) {
+      sessions[from].warned = true;
+
+      await sendText(
+        from,
+        "⏳ ¿Seguís ahí?\n\n" +
+        "Si no respondés, el pedido se va a reiniciar automáticamente."
+      );
+
+      return;
+    }
+
+    // ⛔ Reset total
     if (inactiveMs > SESSION_TIMEOUT_MS) {
       sessions[from] = { step: "salido", lastAction: Date.now() };
+
+      await sendText(
+        from,
+        "⛔ El pedido se reinició por inactividad.\n\n" +
+        "Cuando quieras, podés empezar uno nuevo 👍"
+      );
+
       return;
     }
   }
@@ -206,6 +231,7 @@ async function processWebhook(body) {
       step: cliente ? "menu" : "pedir_nombre_cliente",
       cliente,
       lastAction: Date.now(),
+      warned: false, // 👈 ACÁ
     };
 
     if (!cliente) {
@@ -234,8 +260,10 @@ async function processWebhook(body) {
   if (!rawId) return;
 
   // ✅ Cada interacción válida refresca actividad
-  if (sessions[from]) sessions[from].lastAction = Date.now();
-
+  if (sessions[from]) {
+    sessions[from].lastAction = Date.now();
+    sessions[from].warned = false; // 👈 reset del aviso
+  }
   let id = rawId.trim().toUpperCase();
 
   // ---- MAPEOS ----
@@ -298,6 +326,7 @@ async function processWebhook(body) {
       step: "menu",
       cliente,
       lastAction: Date.now(),
+      warned: false,
     };
 
     await sendText(from, `¡Gracias *${nombreFinal}*! 👍`);
